@@ -724,3 +724,246 @@ fn decode_image_bytes(bytes: &[u8]) -> Option<ImagePixels> {
         rgba: rgba.into_raw(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Path command parser — shared with spatial_index for AABB + hit-test
+// ---------------------------------------------------------------------------
+
+use crate::spatial_index::{CmdKind, PathCmd};
+
+/// Parse an SVG path `d` string into a flat list of abstract commands.
+/// All coordinates are kept in local SVG space (no transform applied).
+/// Relative commands are resolved to absolute coordinates here.
+pub fn parse_path_to_commands(data: &str) -> Vec<PathCmd> {
+    let tokens = tokenize_path_data(data);
+    let mut cmds: Vec<PathCmd> = Vec::new();
+    let mut i = 0;
+    let mut current = (0.0f32, 0.0f32);
+    let mut start = (0.0f32, 0.0f32);
+    let mut last_ctrl: Option<(f32, f32)> = None;
+    let mut in_subpath = false;
+
+    while i < tokens.len() {
+        let cmd = match &tokens[i] {
+            PToken::Cmd(c) => { i += 1; *c }
+            PToken::Num(_) => if in_subpath { 'L' } else { 'M' },
+        };
+
+        match cmd {
+            'M' | 'm' => {
+                let rel = cmd == 'm';
+                let x = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                let y = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                let pt = if rel { (current.0 + x, current.1 + y) } else { (x, y) };
+                cmds.push(PathCmd { kind: CmdKind::Move, points: vec![pt], is_move: true });
+                current = pt;
+                start = pt;
+                in_subpath = true;
+                last_ctrl = None;
+                // Implicit lineto pairs
+                while ppeek(&tokens, i) {
+                    let x2 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y2 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let pt2 = if rel { (current.0 + x2, current.1 + y2) } else { (x2, y2) };
+                    cmds.push(PathCmd { kind: CmdKind::Line, points: vec![pt2], is_move: false });
+                    current = pt2;
+                    last_ctrl = None;
+                }
+            }
+            'L' | 'l' => {
+                let rel = cmd == 'l';
+                while ppeek(&tokens, i) {
+                    let x = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let pt = if rel { (current.0 + x, current.1 + y) } else { (x, y) };
+                    cmds.push(PathCmd { kind: CmdKind::Line, points: vec![pt], is_move: false });
+                    current = pt;
+                    last_ctrl = None;
+                }
+            }
+            'H' | 'h' => {
+                let rel = cmd == 'h';
+                while ppeek(&tokens, i) {
+                    let x = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let nx = if rel { current.0 + x } else { x };
+                    let pt = (nx, current.1);
+                    cmds.push(PathCmd { kind: CmdKind::Line, points: vec![pt], is_move: false });
+                    current = pt;
+                    last_ctrl = None;
+                }
+            }
+            'V' | 'v' => {
+                let rel = cmd == 'v';
+                while ppeek(&tokens, i) {
+                    let y = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let ny = if rel { current.1 + y } else { y };
+                    let pt = (current.0, ny);
+                    cmds.push(PathCmd { kind: CmdKind::Line, points: vec![pt], is_move: false });
+                    current = pt;
+                    last_ctrl = None;
+                }
+            }
+            'C' | 'c' => {
+                let rel = cmd == 'c';
+                while ppeek(&tokens, i) {
+                    let x1 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y1 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let x2 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y2 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let x  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let (cp1, cp2, ep) = if rel {
+                        ((current.0+x1, current.1+y1), (current.0+x2, current.1+y2), (current.0+x, current.1+y))
+                    } else {
+                        ((x1,y1),(x2,y2),(x,y))
+                    };
+                    cmds.push(PathCmd { kind: CmdKind::Cubic, points: vec![cp1, cp2, ep], is_move: false });
+                    last_ctrl = Some(cp2);
+                    current = ep;
+                }
+            }
+            'S' | 's' => {
+                let rel = cmd == 's';
+                while ppeek(&tokens, i) {
+                    let x2 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y2 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let x  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let (cp2, ep) = if rel {
+                        ((current.0+x2, current.1+y2), (current.0+x, current.1+y))
+                    } else {
+                        ((x2,y2),(x,y))
+                    };
+                    let cp1 = match last_ctrl {
+                        Some(lc) => (2.0*current.0 - lc.0, 2.0*current.1 - lc.1),
+                        None => current,
+                    };
+                    cmds.push(PathCmd { kind: CmdKind::Cubic, points: vec![cp1, cp2, ep], is_move: false });
+                    last_ctrl = Some(cp2);
+                    current = ep;
+                }
+            }
+            'Q' | 'q' => {
+                let rel = cmd == 'q';
+                while ppeek(&tokens, i) {
+                    let x1 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y1 = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let x  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let (cp, ep) = if rel {
+                        ((current.0+x1, current.1+y1), (current.0+x, current.1+y))
+                    } else {
+                        ((x1,y1),(x,y))
+                    };
+                    cmds.push(PathCmd { kind: CmdKind::Quadratic, points: vec![cp, ep], is_move: false });
+                    last_ctrl = Some(cp);
+                    current = ep;
+                }
+            }
+            'T' | 't' => {
+                let rel = cmd == 't';
+                while ppeek(&tokens, i) {
+                    let x = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let ep = if rel { (current.0+x, current.1+y) } else { (x,y) };
+                    let cp = match last_ctrl {
+                        Some(lc) => (2.0*current.0 - lc.0, 2.0*current.1 - lc.1),
+                        None => current,
+                    };
+                    cmds.push(PathCmd { kind: CmdKind::Quadratic, points: vec![cp, ep], is_move: false });
+                    last_ctrl = Some(cp);
+                    current = ep;
+                }
+            }
+            'A' | 'a' => {
+                // Arc approximated as a line to endpoint
+                let rel = cmd == 'a';
+                while ppeek(&tokens, i) {
+                    let _rx = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let _ry = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let _xr = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let _la = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let _sw = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let x  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let y  = match pnext(&tokens, &mut i) { Some(v) => v, None => break };
+                    let ep = if rel { (current.0+x, current.1+y) } else { (x,y) };
+                    cmds.push(PathCmd { kind: CmdKind::Line, points: vec![ep], is_move: false });
+                    current = ep;
+                    last_ctrl = None;
+                }
+            }
+            'Z' | 'z' => {
+                cmds.push(PathCmd { kind: CmdKind::Close, points: vec![], is_move: false });
+                current = start;
+                in_subpath = false;
+                last_ctrl = None;
+            }
+            _ => {}
+        }
+    }
+
+    cmds
+}
+
+#[derive(Debug, Clone)]
+enum PToken {
+    Cmd(char),
+    Num(f32),
+}
+
+fn tokenize_path_data(data: &str) -> Vec<PToken> {
+    let mut tokens = Vec::new();
+    let mut chars = data.chars().peekable();
+
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' | '\n' | '\r' | ',' => { chars.next(); }
+            'A'..='Z' | 'a'..='z' => {
+                tokens.push(PToken::Cmd(c));
+                chars.next();
+            }
+            '0'..='9' | '-' | '+' | '.' => {
+                let mut s = String::new();
+                if c == '-' || c == '+' { s.push(c); chars.next(); }
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                }
+                if let Some(&'.') = chars.peek() {
+                    s.push('.'); chars.next();
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                    }
+                }
+                if let Some(&e) = chars.peek() {
+                    if e == 'e' || e == 'E' {
+                        s.push(e); chars.next();
+                        if let Some(&sg) = chars.peek() {
+                            if sg == '-' || sg == '+' { s.push(sg); chars.next(); }
+                        }
+                        while let Some(&d) = chars.peek() {
+                            if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                        }
+                    }
+                }
+                if let Ok(n) = s.parse::<f32>() {
+                    tokens.push(PToken::Num(n));
+                }
+            }
+            _ => { chars.next(); }
+        }
+    }
+    tokens
+}
+
+fn pnext(tokens: &[PToken], i: &mut usize) -> Option<f32> {
+    if let Some(PToken::Num(n)) = tokens.get(*i) {
+        *i += 1;
+        Some(*n)
+    } else {
+        None
+    }
+}
+
+fn ppeek(tokens: &[PToken], i: usize) -> bool {
+    matches!(tokens.get(i), Some(PToken::Num(_)))
+}

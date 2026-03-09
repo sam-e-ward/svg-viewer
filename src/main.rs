@@ -3,6 +3,7 @@ mod svg_doc;
 mod parser;
 mod renderer;
 mod elements_pane;
+mod spatial_index;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();

@@ -1,8 +1,13 @@
 /// SVG renderer — walks the SvgDocument tree and emits egui paint shapes.
-/// This is the M3 basic renderer: handles rects, circles, ellipses,
-/// lines, polylines, polygons and paths (via lyon tessellation).
+///
+/// Performance design:
+///   - Paths are tessellated once in SVG local space and cached in GeometryCache.
+///   - On each frame, cached vertices are transformed by (world_transform × ViewTransform)
+///     and submitted to egui. No re-tessellation on zoom/pan.
+///   - Simple shapes (rect, circle) use egui primitives directly — no tessellation needed.
+///   - The highlighted element is re-drawn last with a vivid solid colour.
 
-use egui::{Color32, Painter, Pos2, Rect, Stroke, TextureHandle, Vec2};
+use egui::{Color32, Painter, Pos2, Rect, Stroke, TextureHandle};
 use egui::epaint::StrokeKind;
 use std::collections::HashMap;
 use lyon::geom::point;
@@ -15,13 +20,14 @@ use lyon::tessellation::{
 
 use crate::svg_doc::*;
 
+// ---------------------------------------------------------------------------
+// View transform
+// ---------------------------------------------------------------------------
+
 /// Screen-space transform: maps SVG user units → egui pixels.
-/// Encapsulates the current pan/zoom state.
 #[derive(Clone, Debug)]
 pub struct ViewTransform {
-    /// Top-left of the SVG canvas in screen pixels
     pub offset: egui::Vec2,
-    /// Pixels per SVG user unit
     pub scale: f32,
 }
 
@@ -37,49 +43,308 @@ impl ViewTransform {
         ViewTransform { offset, scale }
     }
 
+    #[inline]
     pub fn svg_to_screen(&self, x: f32, y: f32) -> Pos2 {
-        Pos2::new(
-            self.offset.x + x * self.scale,
-            self.offset.y + y * self.scale,
-        )
+        Pos2::new(self.offset.x + x * self.scale, self.offset.y + y * self.scale)
     }
 
+    #[inline]
     pub fn screen_to_svg(&self, p: Pos2) -> (f32, f32) {
-        (
-            (p.x - self.offset.x) / self.scale,
-            (p.y - self.offset.y) / self.scale,
-        )
+        ((p.x - self.offset.x) / self.scale, (p.y - self.offset.y) / self.scale)
     }
 
+    #[inline]
     pub fn length(&self, v: f32) -> f32 {
         v * self.scale
     }
 
-    pub fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> Rect {
-        let tl = self.svg_to_screen(x, y);
-        Rect::from_min_size(tl, Vec2::new(w * self.scale, h * self.scale))
+    /// Transform a point from SVG local space to screen space,
+    /// applying the world transform first.
+    #[inline]
+    pub fn world_to_screen(&self, world: &Transform, x: f32, y: f32) -> Pos2 {
+        let (wx, wy) = world.apply(x, y);
+        self.svg_to_screen(wx, wy)
+    }
+
+    /// Apply ViewTransform to an already-world-transformed SVG point.
+    #[inline]
+    pub fn apply_to_pos(&self, x: f32, y: f32) -> Pos2 {
+        Pos2::new(self.offset.x + x * self.scale, self.offset.y + y * self.scale)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Top-level render call
+// Geometry cache — tessellations in SVG local space
+// ---------------------------------------------------------------------------
+
+/// Raw tessellation output in SVG local coordinates.
+/// Stored per NodeId, invalidated on document reload.
+#[derive(Clone)]
+pub struct CachedGeometry {
+    /// Fill triangles. Vertices are in SVG local space.
+    pub fill: Option<RawMesh>,
+    /// Stroke triangles. Vertices are in SVG local space.
+    /// Tessellated at unit scale (stroke_width = SVG units).
+    pub stroke: Option<RawMesh>,
+}
+
+#[derive(Clone)]
+pub struct RawMesh {
+    pub vertices: Vec<[f32; 2]>, // local SVG coords
+    pub indices: Vec<u32>,
+    /// Conservative local-space AABB of the vertices (min_x, min_y, max_x, max_y).
+    pub local_bounds: [f32; 4],
+}
+
+impl RawMesh {
+    fn compute_bounds(vertices: &[[f32; 2]]) -> [f32; 4] {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for &[x, y] in vertices {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        [min_x, min_y, max_x, max_y]
+    }
+
+    /// Check if this mesh's screen-space AABB intersects the viewport.
+    pub fn intersects_viewport(&self, world: &Transform, vt: &ViewTransform, viewport: Rect) -> bool {
+        let [min_x, min_y, max_x, max_y] = self.local_bounds;
+        if min_x.is_infinite() { return false; }
+        // Transform the 4 corners of the local AABB to screen space
+        let corners = [(min_x, min_y), (max_x, min_y), (min_x, max_y), (max_x, max_y)];
+        let mut smin_x = f32::INFINITY;
+        let mut smin_y = f32::INFINITY;
+        let mut smax_x = f32::NEG_INFINITY;
+        let mut smax_y = f32::NEG_INFINITY;
+        for &(x, y) in &corners {
+            let p = vt.world_to_screen(world, x, y);
+            smin_x = smin_x.min(p.x);
+            smin_y = smin_y.min(p.y);
+            smax_x = smax_x.max(p.x);
+            smax_y = smax_y.max(p.y);
+        }
+        let screen_rect = Rect::from_min_max(Pos2::new(smin_x, smin_y), Pos2::new(smax_x, smax_y));
+        viewport.intersects(screen_rect)
+    }
+
+    /// Emit this mesh to egui, applying the combined world+view transform
+    /// and tinting with `color`.
+    pub fn emit(&self, painter: &Painter, world: &Transform, vt: &ViewTransform, color: Color32) {
+        if self.vertices.is_empty() {
+            return;
+        }
+        let verts: Vec<egui::epaint::Vertex> = self
+            .vertices
+            .iter()
+            .map(|&[x, y]| {
+                let (wx, wy) = world.apply(x, y);
+                egui::epaint::Vertex {
+                    pos: vt.apply_to_pos(wx, wy),
+                    uv: egui::epaint::WHITE_UV,
+                    color,
+                }
+            })
+            .collect();
+        painter.add(egui::Shape::mesh(egui::Mesh {
+            vertices: verts,
+            indices: self.indices.clone(),
+            texture_id: egui::TextureId::default(),
+        }));
+    }
+}
+
+/// Cache of tessellated geometry keyed by NodeId.
+/// Lives in SvgViewerApp and is rebuilt when the document changes.
+pub struct GeometryCache {
+    pub meshes: HashMap<NodeId, CachedGeometry>,
+}
+
+impl GeometryCache {
+    pub fn new() -> Self {
+        GeometryCache { meshes: HashMap::new() }
+    }
+
+    /// Populate the cache by walking the document tree.
+    /// Call once after parsing; zoom/pan do not invalidate it.
+    pub fn build(doc: &SvgDocument) -> Self {
+        let mut cache = GeometryCache::new();
+        cache.populate(doc, doc.root, &Transform::identity());
+        cache
+    }
+
+    fn populate(&mut self, doc: &SvgDocument, node_id: NodeId, parent_tf: &Transform) {
+        let node = doc.get(node_id);
+        let world = parent_tf.concat(&node.transform);
+
+        match &node.kind {
+            SvgNodeKind::Svg { .. } | SvgNodeKind::Group => {
+                for &child in &node.children {
+                    self.populate(doc, child, &world);
+                }
+            }
+            SvgNodeKind::Shape(SvgShape::Path { data }) => {
+                let geom = tessellate_path_local(data, &node.style);
+                self.meshes.insert(node_id, geom);
+            }
+            SvgNodeKind::Shape(SvgShape::Ellipse { cx, cy, rx, ry }) => {
+                let geom = tessellate_ellipse_local(*cx, *cy, *rx, *ry, &node.style);
+                self.meshes.insert(node_id, geom);
+            }
+            SvgNodeKind::Shape(SvgShape::Polygon { points }) => {
+                let geom = tessellate_polygon_local(points, &node.style);
+                self.meshes.insert(node_id, geom);
+            }
+            SvgNodeKind::Shape(SvgShape::Polyline { points }) => {
+                let geom = tessellate_polyline_local(points, &node.style);
+                self.meshes.insert(node_id, geom);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render context
 // ---------------------------------------------------------------------------
 
 pub struct RenderContext<'a> {
     pub doc: &'a SvgDocument,
     pub vt: &'a ViewTransform,
     pub painter: &'a Painter,
-    /// NodeId of the highlighted element (None if none)
+    /// The visible screen rect — used for viewport culling.
+    pub viewport: Rect,
     pub highlight: Option<NodeId>,
-    /// Pre-uploaded image textures keyed by NodeId
     pub textures: &'a HashMap<NodeId, TextureHandle>,
+    pub cache: &'a GeometryCache,
 }
 
+// ---------------------------------------------------------------------------
+// Main render entry
+// ---------------------------------------------------------------------------
+
 pub fn render(ctx: &RenderContext) {
-    // Walk from root
-    let root = ctx.doc.root;
-    render_node(ctx, root, &Transform::identity());
+    render_node(ctx, ctx.doc.root, &Transform::identity());
+
+    // Draw highlighted element last — on top of everything
+    if let Some(h) = ctx.highlight {
+        render_highlight(ctx, h);
+    }
 }
+
+fn render_node(ctx: &RenderContext, node_id: NodeId, parent_tf: &Transform) {
+    let node = ctx.doc.get(node_id);
+    let world = parent_tf.concat(&node.transform);
+
+    match &node.kind {
+        SvgNodeKind::Svg { .. } | SvgNodeKind::Group => {
+            for &child in &node.children {
+                render_node(ctx, child, &world);
+            }
+        }
+        SvgNodeKind::Shape(shape) => {
+            // Viewport cull: skip shapes whose screen-space AABB doesn't
+            // intersect the visible viewport. This is the critical optimisation
+            // for high zoom levels where most elements are off-screen.
+            if !shape_screen_aabb_intersects_viewport(shape, &world, ctx) {
+                return;
+            }
+            render_shape(ctx, node, shape, &world);
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Viewport culling
+// ---------------------------------------------------------------------------
+
+/// Returns false if the shape is entirely outside the visible viewport.
+/// Uses a conservative (over-approximate) screen-space AABB.
+/// A false negative (returning true for an off-screen shape) is safe — it
+/// just means we draw it anyway. A false positive (culling a visible shape)
+/// would be a rendering bug, so we err on the side of inclusion.
+fn shape_screen_aabb_intersects_viewport(
+    shape: &SvgShape,
+    world: &Transform,
+    ctx: &RenderContext,
+) -> bool {
+    let vp = ctx.viewport;
+    let vt = ctx.vt;
+
+    // Convert a set of SVG local-space corners to a screen-space Rect.
+    let corners_to_screen_rect = |corners: &[(f32, f32)]| -> Rect {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for &(x, y) in corners {
+            let p = vt.world_to_screen(world, x, y);
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+        Rect::from_min_max(Pos2::new(min_x, min_y), Pos2::new(max_x, max_y))
+    };
+
+    let shape_rect = match shape {
+        SvgShape::Rect { x, y, width, height, .. } => {
+            corners_to_screen_rect(&[
+                (*x, *y), (x + width, *y),
+                (*x, y + height), (x + width, y + height),
+            ])
+        }
+        SvgShape::Circle { cx, cy, r } => {
+            let center = vt.world_to_screen(world, *cx, *cy);
+            let radius = r * transform_max_scale(world) * vt.scale;
+            Rect::from_center_size(center, egui::Vec2::splat(radius * 2.0))
+        }
+        SvgShape::Ellipse { cx, cy, rx, ry } => {
+            corners_to_screen_rect(&[
+                (cx - rx, cy - ry), (cx + rx, cy - ry),
+                (cx - rx, cy + ry), (cx + rx, cy + ry),
+            ])
+        }
+        SvgShape::Line { x1, y1, x2, y2 } => {
+            corners_to_screen_rect(&[(*x1, *y1), (*x2, *y2)])
+        }
+        SvgShape::Polyline { points } | SvgShape::Polygon { points } => {
+            if points.is_empty() { return false; }
+            corners_to_screen_rect(points)
+        }
+        SvgShape::Path { .. } => {
+            // Path culling is handled per-mesh inside render_shape using
+            // RawMesh::intersects_viewport. Return true here so render_shape runs.
+            return true;
+        }
+        SvgShape::Text { x, y, spans, font_size } => {
+            let total_chars: usize = spans.iter().map(|s| s.content.len()).sum();
+            let w = total_chars as f32 * font_size * 0.7;
+            corners_to_screen_rect(&[
+                (*x, y - font_size), (x + w, y - font_size),
+                (*x, *y), (x + w, *y),
+            ])
+        }
+        SvgShape::Image { x, y, width, height, .. } => {
+            corners_to_screen_rect(&[
+                (*x, *y), (x + width, *y),
+                (*x, y + height), (x + width, y + height),
+            ])
+        }
+        SvgShape::Use { .. } => return false,
+    };
+
+    vp.intersects(shape_rect)
+}
+
+// ---------------------------------------------------------------------------
+// Shape rendering
+// ---------------------------------------------------------------------------
 
 fn resolve_paint(paint: &Paint, opacity: f32) -> Option<Color32> {
     match paint {
@@ -88,204 +353,84 @@ fn resolve_paint(paint: &Paint, opacity: f32) -> Option<Color32> {
             let a = (c.a as f32 * opacity).round() as u8;
             Some(Color32::from_rgba_unmultiplied(c.r, c.g, c.b, a))
         }
-        // Gradient stubs — fall back to a mid-gray
         Paint::LinearGradient(_) | Paint::RadialGradient(_) => {
             Some(Color32::from_rgba_unmultiplied(150, 150, 150, (255.0 * opacity) as u8))
         }
     }
 }
 
-fn render_node(ctx: &RenderContext, node_id: NodeId, parent_transform: &Transform) {
-    let node = ctx.doc.get(node_id);
-
-    // Combine transforms
-    let combined = parent_transform.concat(&node.transform);
-
-    let is_highlight = ctx.highlight == Some(node_id);
-
-    match &node.kind {
-        SvgNodeKind::Svg { .. } | SvgNodeKind::Group => {
-            for &child in &node.children {
-                render_node(ctx, child, &combined);
-            }
-        }
-        SvgNodeKind::Defs
-        | SvgNodeKind::ClipPath { .. }
-        | SvgNodeKind::Mask { .. }
-        | SvgNodeKind::LinearGradient { .. }
-        | SvgNodeKind::RadialGradient { .. }
-        | SvgNodeKind::Unknown { .. } => {
-            // Not rendered directly
-        }
-        SvgNodeKind::Shape(shape) => {
-            render_shape(ctx, node, shape, &combined, is_highlight);
-        }
-    }
-}
-
-fn render_shape(
-    ctx: &RenderContext,
-    node: &SvgNode,
-    shape: &SvgShape,
-    transform: &Transform,
-    highlight: bool,
-) {
+fn render_shape(ctx: &RenderContext, node: &SvgNode, shape: &SvgShape, world: &Transform) {
     let style = &node.style;
-    let effective_opacity = style.opacity;
-
-    let fill_color = resolve_paint(&style.fill, style.fill_opacity * effective_opacity);
-    let stroke_color = resolve_paint(&style.stroke, style.stroke_opacity * effective_opacity);
-    let stroke_width = ctx.vt.length(style.stroke_width).max(0.5);
-
-    let stroke = match stroke_color {
-        Some(c) => Stroke::new(stroke_width, c),
-        None => Stroke::NONE,
-    };
+    let opacity = style.opacity;
+    let fill_color = resolve_paint(&style.fill, style.fill_opacity * opacity);
+    let stroke_color = resolve_paint(&style.stroke, style.stroke_opacity * opacity);
+    let stroke_w_svg = style.stroke_width; // in SVG units
 
     match shape {
         SvgShape::Rect { x, y, width, height, rx, ry } => {
-            let (tx, ty) = apply_transform(transform, *x, *y);
-            // Scale width/height by the transform scale (approximate for non-uniform)
-            let sw = *width * transform_scale_x(transform) * ctx.vt.scale;
-            let sh = *height * transform_scale_y(transform) * ctx.vt.scale;
-            let screen_tl = ctx.vt.svg_to_screen(tx, ty);
-            // Correct for already-applied scale factor in svg_to_screen
-            let screen_tl_raw = Pos2::new(
-                ctx.vt.offset.x + tx * ctx.vt.scale,
-                ctx.vt.offset.y + ty * ctx.vt.scale,
-            );
-            let rect = Rect::from_min_size(screen_tl_raw, Vec2::new(sw, sh));
-            let rounding = egui::CornerRadius::same(
-                ((*rx).max(*ry) * ctx.vt.scale) as u8,
-            );
-
+            let tl = ctx.vt.world_to_screen(world, *x, *y);
+            let br = ctx.vt.world_to_screen(world, x + width, y + height);
+            let rect = Rect::from_two_pos(tl, br);
+            let rounding = egui::CornerRadius::same((rx.max(*ry) * ctx.vt.scale) as u8);
             if let Some(fill) = fill_color {
                 ctx.painter.rect_filled(rect, rounding, fill);
             }
-            if stroke.width > 0.0 {
-                ctx.painter.rect_stroke(rect, rounding, stroke, StrokeKind::Middle);
-            }
-            if highlight {
-                draw_highlight_rect(ctx, rect);
+            if let Some(sc) = stroke_color {
+                let sw = (stroke_w_svg * ctx.vt.scale).max(0.5);
+                ctx.painter.rect_stroke(rect, rounding, Stroke::new(sw, sc), StrokeKind::Middle);
             }
         }
 
         SvgShape::Circle { cx, cy, r } => {
-            let (tx, ty) = apply_transform(transform, *cx, *cy);
-            let center = ctx.vt.svg_to_screen(tx, ty);
-            let radius = r * transform_scale_x(transform) * ctx.vt.scale;
-
+            let center = ctx.vt.world_to_screen(world, *cx, *cy);
+            let radius = r * transform_max_scale(world) * ctx.vt.scale;
             if let Some(fill) = fill_color {
                 ctx.painter.circle_filled(center, radius, fill);
             }
-            if stroke.width > 0.0 {
-                ctx.painter.circle_stroke(center, radius, stroke);
-            }
-            if highlight {
-                draw_highlight_circle(ctx, center, radius);
+            if let Some(sc) = stroke_color {
+                let sw = (stroke_w_svg * ctx.vt.scale).max(0.5);
+                ctx.painter.circle_stroke(center, radius, Stroke::new(sw, sc));
             }
         }
 
-        SvgShape::Ellipse { cx, cy, rx, ry } => {
-            let (tx, ty) = apply_transform(transform, *cx, *cy);
-            let center = ctx.vt.svg_to_screen(tx, ty);
-            let screen_rx = rx * transform_scale_x(transform) * ctx.vt.scale;
-            let screen_ry = ry * transform_scale_y(transform) * ctx.vt.scale;
-            render_ellipse(ctx, center, screen_rx, screen_ry, fill_color, stroke, highlight);
+        SvgShape::Ellipse { .. } | SvgShape::Polyline { .. }
+        | SvgShape::Polygon { .. } | SvgShape::Path { .. } => {
+            if let Some(geom) = ctx.cache.meshes.get(&node.id) {
+                // Use fill mesh bounds for the viewport cull (fill and stroke share
+                // the same geometry extent, so checking one is enough).
+                let visible = geom.fill.as_ref()
+                    .map(|m| m.intersects_viewport(world, ctx.vt, ctx.viewport))
+                    .or_else(|| geom.stroke.as_ref()
+                        .map(|m| m.intersects_viewport(world, ctx.vt, ctx.viewport)))
+                    .unwrap_or(false);
+
+                if !visible { return; }
+
+                if let Some(fill) = fill_color {
+                    if let Some(m) = &geom.fill { m.emit(ctx.painter, world, ctx.vt, fill); }
+                }
+                if let Some(sc) = stroke_color {
+                    if let Some(m) = &geom.stroke { m.emit(ctx.painter, world, ctx.vt, sc); }
+                }
+            }
         }
 
         SvgShape::Line { x1, y1, x2, y2 } => {
-            let (tx1, ty1) = apply_transform(transform, *x1, *y1);
-            let (tx2, ty2) = apply_transform(transform, *x2, *y2);
-            let p1 = ctx.vt.svg_to_screen(tx1, ty1);
-            let p2 = ctx.vt.svg_to_screen(tx2, ty2);
-            let eff_stroke = if stroke.width > 0.0 {
-                stroke
-            } else if let Some(fc) = fill_color {
-                Stroke::new(1.0, fc)
-            } else {
-                return;
-            };
-            ctx.painter.line_segment([p1, p2], eff_stroke);
-            if highlight {
-                ctx.painter.line_segment(
-                    [p1, p2],
-                    Stroke::new(eff_stroke.width + 2.0, highlight_color()),
-                );
-            }
-        }
-
-        SvgShape::Polyline { points } | SvgShape::Polygon { points } => {
-            if points.len() < 2 {
-                return;
-            }
-            let screen_pts: Vec<Pos2> = points
-                .iter()
-                .map(|(px, py)| {
-                    let (tx, ty) = apply_transform(transform, *px, *py);
-                    ctx.vt.svg_to_screen(tx, ty)
-                })
-                .collect();
-
-            let is_polygon = matches!(shape, SvgShape::Polygon { .. });
-
-            if let Some(fill) = fill_color {
-                if is_polygon && screen_pts.len() >= 3 {
-                    let mesh = polygon_to_mesh(&screen_pts, fill);
-                    ctx.painter.add(mesh);
-                }
-            }
-
-            // Draw outline
-            let out_stroke = if stroke.width > 0.0 { stroke } else { Stroke::NONE };
-            if out_stroke.width > 0.0 {
-                let mut pts = screen_pts.clone();
-                if is_polygon {
-                    pts.push(pts[0]);
-                }
-                for w in pts.windows(2) {
-                    ctx.painter.line_segment([w[0], w[1]], out_stroke);
-                }
-            }
-
-            if highlight {
-                let mut pts = screen_pts.clone();
-                if is_polygon {
-                    pts.push(pts[0]);
-                }
-                for w in pts.windows(2) {
-                    ctx.painter.line_segment(
-                        [w[0], w[1]],
-                        Stroke::new(2.0, highlight_color()),
-                    );
-                }
-            }
-        }
-
-        SvgShape::Path { data } => {
-            render_path(
-                ctx,
-                data,
-                transform,
-                fill_color,
-                stroke,
-                highlight,
-            );
+            let p1 = ctx.vt.world_to_screen(world, *x1, *y1);
+            let p2 = ctx.vt.world_to_screen(world, *x2, *y2);
+            let c = stroke_color.or(fill_color).unwrap_or(Color32::BLACK);
+            let sw = (stroke_w_svg * ctx.vt.scale).max(1.0);
+            ctx.painter.line_segment([p1, p2], Stroke::new(sw, c));
         }
 
         SvgShape::Text { x, y, spans, font_size } => {
-            render_text(ctx, node, *x, *y, *font_size, spans, transform, fill_color, highlight);
+            render_text_spans(ctx, node, *x, *y, *font_size, spans, world, fill_color);
         }
 
         SvgShape::Image { x, y, width, height, .. } => {
-            let (tx, ty) = apply_transform(transform, *x, *y);
-            let sw = width * transform_scale_x(transform) * ctx.vt.scale;
-            let sh = height * transform_scale_y(transform) * ctx.vt.scale;
-            let rect = Rect::from_min_size(
-                Pos2::new(ctx.vt.offset.x + tx * ctx.vt.scale, ctx.vt.offset.y + ty * ctx.vt.scale),
-                Vec2::new(sw, sh),
-            );
-
+            let tl = ctx.vt.world_to_screen(world, *x, *y);
+            let br = ctx.vt.world_to_screen(world, x + width, y + height);
+            let rect = Rect::from_two_pos(tl, br);
             if let Some(tex) = ctx.textures.get(&node.id) {
                 ctx.painter.image(
                     tex.id(),
@@ -294,57 +439,131 @@ fn render_shape(
                     Color32::WHITE,
                 );
             } else {
-                // No decoded texture — draw a hatched placeholder
-                ctx.painter.rect_filled(
-                    rect,
-                    egui::CornerRadius::ZERO,
-                    Color32::from_rgba_unmultiplied(180, 180, 180, 60),
-                );
-                ctx.painter.rect_stroke(
-                    rect,
-                    egui::CornerRadius::ZERO,
-                    Stroke::new(1.0, Color32::from_gray(140)),
-                    StrokeKind::Middle,
-                );
-                // Cross lines to indicate "image missing"
-                ctx.painter.line_segment([rect.left_top(), rect.right_bottom()], Stroke::new(1.0, Color32::from_gray(160)));
-                ctx.painter.line_segment([rect.right_top(), rect.left_bottom()], Stroke::new(1.0, Color32::from_gray(160)));
-            }
-
-            if highlight {
-                draw_highlight_rect(ctx, rect);
+                ctx.painter.rect_filled(rect, egui::CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(180, 180, 180, 60));
+                ctx.painter.rect_stroke(rect, egui::CornerRadius::ZERO,
+                    Stroke::new(1.0, Color32::from_gray(140)), StrokeKind::Middle);
+                ctx.painter.line_segment([rect.left_top(), rect.right_bottom()],
+                    Stroke::new(1.0, Color32::from_gray(160)));
+                ctx.painter.line_segment([rect.right_top(), rect.left_bottom()],
+                    Stroke::new(1.0, Color32::from_gray(160)));
             }
         }
 
-        SvgShape::Use { .. } => {
-            // Resolved separately in a later milestone; skip for now
+        SvgShape::Use { .. } => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Highlight — re-render the element in solid vivid colour on top
+// ---------------------------------------------------------------------------
+
+const HIGHLIGHT_FILL: Color32 = Color32::from_rgba_premultiplied(255, 80, 0, 160);
+const HIGHLIGHT_STROKE: Color32 = Color32::from_rgba_premultiplied(255, 80, 0, 255);
+
+pub fn highlight_color() -> Color32 { HIGHLIGHT_STROKE }
+
+fn render_highlight(ctx: &RenderContext, node_id: NodeId) {
+    let node = ctx.doc.get(node_id);
+    // Recompute world transform for this node by walking ancestors
+    let world = compute_world_transform(ctx.doc, node_id);
+
+    let shape = match &node.kind {
+        SvgNodeKind::Shape(s) => s,
+        _ => return,
+    };
+
+    match shape {
+        SvgShape::Rect { x, y, width, height, rx, ry } => {
+            let tl = ctx.vt.world_to_screen(&world, *x, *y);
+            let br = ctx.vt.world_to_screen(&world, x + width, y + height);
+            let rect = Rect::from_two_pos(tl, br);
+            let rounding = egui::CornerRadius::same((rx.max(*ry) * ctx.vt.scale) as u8);
+            ctx.painter.rect(rect, rounding, HIGHLIGHT_FILL,
+                Stroke::new(2.0, HIGHLIGHT_STROKE), StrokeKind::Outside);
+        }
+        SvgShape::Circle { cx, cy, r } => {
+            let center = ctx.vt.world_to_screen(&world, *cx, *cy);
+            let radius = r * transform_max_scale(&world) * ctx.vt.scale;
+            ctx.painter.circle(center, radius, HIGHLIGHT_FILL,
+                Stroke::new(2.0, HIGHLIGHT_STROKE));
+        }
+        SvgShape::Ellipse { .. } | SvgShape::Path { .. }
+        | SvgShape::Polygon { .. } | SvgShape::Polyline { .. } => {
+            if let Some(geom) = ctx.cache.meshes.get(&node_id) {
+                if let Some(m) = &geom.fill {
+                    m.emit(ctx.painter, &world, ctx.vt, HIGHLIGHT_FILL);
+                }
+                if let Some(m) = &geom.stroke {
+                    m.emit(ctx.painter, &world, ctx.vt, HIGHLIGHT_STROKE);
+                }
+                // If there was no fill at all (e.g. stroke-only path), still show something
+                if geom.fill.is_none() && geom.stroke.is_none() {
+                    // fall through to line
+                }
+            }
+        }
+        SvgShape::Line { x1, y1, x2, y2 } => {
+            let p1 = ctx.vt.world_to_screen(&world, *x1, *y1);
+            let p2 = ctx.vt.world_to_screen(&world, *x2, *y2);
+            ctx.painter.line_segment([p1, p2], Stroke::new(3.0, HIGHLIGHT_STROKE));
+        }
+        SvgShape::Text { x, y, spans, font_size } => {
+            // Highlight: re-render text in vivid colour
+            render_text_spans(ctx, node, *x, *y, *font_size, spans, &world,
+                Some(HIGHLIGHT_STROKE));
+        }
+        SvgShape::Image { x, y, width, height, .. } => {
+            let tl = ctx.vt.world_to_screen(&world, *x, *y);
+            let br = ctx.vt.world_to_screen(&world, x + width, y + height);
+            let rect = Rect::from_two_pos(tl, br);
+            ctx.painter.rect(rect, egui::CornerRadius::ZERO, HIGHLIGHT_FILL,
+                Stroke::new(2.0, HIGHLIGHT_STROKE), StrokeKind::Outside);
+        }
+        SvgShape::Use { .. } => {}
+    }
+}
+
+/// Walk ancestors to rebuild the world transform for a given node.
+fn compute_world_transform(doc: &SvgDocument, node_id: NodeId) -> Transform {
+    // Collect ancestor chain
+    let mut chain = Vec::new();
+    let mut cur = node_id;
+    loop {
+        let node = doc.get(cur);
+        chain.push(node.transform.clone());
+        match node.parent {
+            Some(p) => cur = p,
+            None => break,
         }
     }
+    // Apply from root → node
+    let mut world = Transform::identity();
+    for t in chain.iter().rev() {
+        world = world.concat(t);
+    }
+    world
 }
 
 // ---------------------------------------------------------------------------
 // Text rendering
 // ---------------------------------------------------------------------------
 
-fn render_text(
+fn render_text_spans(
     ctx: &RenderContext,
     node: &SvgNode,
     base_x: f32,
     base_y: f32,
     base_font_size: f32,
     spans: &[TextSpan],
-    transform: &Transform,
+    world: &Transform,
     default_fill: Option<Color32>,
-    highlight: bool,
 ) {
-    // We track a running cursor in SVG units for relative positioning
     let mut cursor_x = base_x;
     let mut cursor_y = base_y;
 
     for span in spans {
         let font_size = span.font_size.unwrap_or(base_font_size);
-
-        // Resolve fill: span override → node default → black
         let color = span
             .fill
             .as_ref()
@@ -352,505 +571,52 @@ fn render_text(
             .or(default_fill)
             .unwrap_or(Color32::BLACK);
 
-        // Absolute position overrides cursor; relative is additive
         let sx = span.x.unwrap_or(cursor_x) + span.dx;
         let sy = span.y.unwrap_or(cursor_y) + span.dy;
 
-        let (tx, ty) = apply_transform(transform, sx, sy);
-        let pos = ctx.vt.svg_to_screen(tx, ty);
+        let pos = ctx.vt.world_to_screen(world, sx, sy);
         let screen_size = (font_size * ctx.vt.scale).max(4.0);
+        let font_id = egui::FontId::proportional(screen_size);
 
-        let font_id = match (&span.font_weight, &span.font_style) {
-            (FontWeight::Bold, FontStyle::Italic) => egui::FontId::new(screen_size, egui::FontFamily::Proportional),
-            (FontWeight::Bold, _) => egui::FontId::new(screen_size, egui::FontFamily::Proportional),
-            (_, FontStyle::Italic) => egui::FontId::new(screen_size, egui::FontFamily::Proportional),
-            _ => egui::FontId::proportional(screen_size),
-        };
-
-        // Measure so we can advance cursor
-        let galley = ctx.painter.layout_no_wrap(
-            span.content.clone(),
-            font_id.clone(),
-            color,
-        );
-
+        let galley = ctx.painter.layout_no_wrap(span.content.clone(), font_id, color);
+        let advance_px = galley.size().x;
         ctx.painter.galley(pos, galley, color);
 
-        // Advance cursor by the text width in SVG units
-        let advance = span.content.len() as f32 * font_size * 0.6;
-        cursor_x = sx + advance;
+        // Advance cursor in SVG units using the actual rendered width
+        let advance_svg = advance_px / ctx.vt.scale;
+        cursor_x = sx + advance_svg;
         cursor_y = sy;
     }
-
-    if highlight {
-        // Draw a highlight underline under the whole text block
-        if !spans.is_empty() {
-            let first = &spans[0];
-            let sx = first.x.unwrap_or(base_x);
-            let sy = first.y.unwrap_or(base_y);
-            let (tx, ty) = apply_transform(transform, sx, sy);
-            let p1 = ctx.vt.svg_to_screen(tx, ty);
-            let total_w: f32 = spans
-                .iter()
-                .map(|s| s.content.len() as f32 * s.font_size.unwrap_or(base_font_size) * 0.6)
-                .sum();
-            let (tx2, _) = apply_transform(transform, sx + total_w, sy);
-            let p2 = ctx.vt.svg_to_screen(tx2, ty);
-            ctx.painter.line_segment([p1, p2], Stroke::new(2.0, highlight_color()));
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Path rendering via lyon
+// Local-space tessellation (for cache)
 // ---------------------------------------------------------------------------
 
-fn render_path(
-    ctx: &RenderContext,
-    data: &str,
-    transform: &Transform,
-    fill_color: Option<Color32>,
-    stroke: Stroke,
-    highlight: bool,
-) {
-    let lyon_path = match parse_svg_path(data, transform, ctx.vt) {
+/// Tessellate a path `d` string in SVG local coordinates (no ViewTransform).
+fn tessellate_path_local(data: &str, style: &Style) -> CachedGeometry {
+    let lyon_path = match parse_svg_path_local(data) {
         Some(p) => p,
-        None => return,
+        None => return CachedGeometry { fill: None, stroke: None },
     };
 
-    if let Some(fill) = fill_color {
-        if let Some(mesh) = tessellate_fill(&lyon_path, fill) {
-            ctx.painter.add(mesh);
-        }
-    }
-
-    if stroke.width > 0.0 {
-        if let Some(mesh) = tessellate_stroke(&lyon_path, stroke) {
-            ctx.painter.add(mesh);
-        }
-    }
-
-    if highlight {
-        if let Some(mesh) = tessellate_stroke(
-            &lyon_path,
-            Stroke::new(2.0, highlight_color()),
-        ) {
-            ctx.painter.add(mesh);
-        }
-    }
-}
-
-fn parse_svg_path(data: &str, transform: &Transform, vt: &ViewTransform) -> Option<LyonPath> {
-    let mut builder = LyonPath::builder();
-    let mut current = Point::new(0.0, 0.0);
-    let mut start = Point::new(0.0, 0.0);
-    let mut last_ctrl: Option<Point> = None;
-
-    let tokens = tokenize_path(data);
-    let mut i = 0;
-
-    let to_screen = |x: f32, y: f32| -> Point {
-        let (tx, ty) = transform.apply(x, y);
-        let sp = vt.svg_to_screen(tx, ty);
-        point(sp.x, sp.y)
-    };
-
-    let to_screen_delta = |dx: f32, dy: f32, from: Point| -> Point {
-        // For relative commands, add delta to current SVG point then transform
-        let svg_from = {
-            // Approximate: invert the screen->svg for current point
-            let svgx = (from.x - vt.offset.x) / vt.scale;
-            let svgy = (from.y - vt.offset.y) / vt.scale;
-            (svgx, svgy)
-        };
-        to_screen(svg_from.0 + dx, svg_from.1 + dy)
-    };
-
-    let mut in_subpath = false;
-
-    while i < tokens.len() {
-        let cmd = match &tokens[i] {
-            PathToken::Cmd(c) => {
-                i += 1;
-                *c
-            }
-            // Implicit lineto if we see numbers without a command
-            PathToken::Num(_) => {
-                if in_subpath { 'L' } else { 'M' }
-            }
-        };
-
-        match cmd {
-            'M' | 'm' => {
-                let relative = cmd == 'm';
-                let x = next_num(&tokens, &mut i)?;
-                let y = next_num(&tokens, &mut i)?;
-                let p = if relative { to_screen_delta(x, y, current) } else { to_screen(x, y) };
-                if in_subpath {
-                    builder.end(false);
-                }
-                builder.begin(p);
-                current = p;
-                start = p;
-                in_subpath = true;
-                last_ctrl = None;
-
-                // Subsequent coord pairs are implicit LineTo
-                while peek_num(&tokens, i) {
-                    let x2 = next_num(&tokens, &mut i)?;
-                    let y2 = next_num(&tokens, &mut i)?;
-                    let p2 = if relative { to_screen_delta(x2, y2, current) } else { to_screen(x2, y2) };
-                    builder.line_to(p2);
-                    current = p2;
-                    last_ctrl = None;
-                }
-            }
-
-            'L' | 'l' => {
-                let relative = cmd == 'l';
-                while peek_num(&tokens, i) {
-                    let x = next_num(&tokens, &mut i)?;
-                    let y = next_num(&tokens, &mut i)?;
-                    let p = if relative { to_screen_delta(x, y, current) } else { to_screen(x, y) };
-                    if !in_subpath {
-                        builder.begin(p);
-                        in_subpath = true;
-                        start = p;
-                    } else {
-                        builder.line_to(p);
-                    }
-                    current = p;
-                    last_ctrl = None;
-                }
-            }
-
-            'H' | 'h' => {
-                let relative = cmd == 'h';
-                while peek_num(&tokens, i) {
-                    let x = next_num(&tokens, &mut i)?;
-                    let svg_cur = vt.screen_to_svg(Pos2::new(current.x, current.y));
-                    let nx = if relative { svg_cur.0 + x } else { x };
-                    let p = to_screen(nx, svg_cur.1);
-                    builder.line_to(p);
-                    current = p;
-                    last_ctrl = None;
-                }
-            }
-
-            'V' | 'v' => {
-                let relative = cmd == 'v';
-                while peek_num(&tokens, i) {
-                    let y = next_num(&tokens, &mut i)?;
-                    let svg_cur = vt.screen_to_svg(Pos2::new(current.x, current.y));
-                    let ny = if relative { svg_cur.1 + y } else { y };
-                    let p = to_screen(svg_cur.0, ny);
-                    builder.line_to(p);
-                    current = p;
-                    last_ctrl = None;
-                }
-            }
-
-            'C' | 'c' => {
-                let relative = cmd == 'c';
-                while peek_num(&tokens, i) {
-                    let (x1, y1, x2, y2, x, y) = (
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                    );
-                    let (cp1, cp2, end) = if relative {
-                        (
-                            to_screen_delta(x1, y1, current),
-                            to_screen_delta(x2, y2, current),
-                            to_screen_delta(x, y, current),
-                        )
-                    } else {
-                        (to_screen(x1, y1), to_screen(x2, y2), to_screen(x, y))
-                    };
-                    builder.cubic_bezier_to(cp1, cp2, end);
-                    last_ctrl = Some(cp2);
-                    current = end;
-                }
-            }
-
-            'S' | 's' => {
-                let relative = cmd == 's';
-                while peek_num(&tokens, i) {
-                    let (x2, y2, x, y) = (
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                    );
-                    let (cp2, end) = if relative {
-                        (to_screen_delta(x2, y2, current), to_screen_delta(x, y, current))
-                    } else {
-                        (to_screen(x2, y2), to_screen(x, y))
-                    };
-                    // Reflect last control point
-                    let cp1 = match last_ctrl {
-                        Some(lc) => point(2.0 * current.x - lc.x, 2.0 * current.y - lc.y),
-                        None => current,
-                    };
-                    builder.cubic_bezier_to(cp1, cp2, end);
-                    last_ctrl = Some(cp2);
-                    current = end;
-                }
-            }
-
-            'Q' | 'q' => {
-                let relative = cmd == 'q';
-                while peek_num(&tokens, i) {
-                    let (x1, y1, x, y) = (
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                        next_num(&tokens, &mut i)?,
-                    );
-                    let (cp, end) = if relative {
-                        (to_screen_delta(x1, y1, current), to_screen_delta(x, y, current))
-                    } else {
-                        (to_screen(x1, y1), to_screen(x, y))
-                    };
-                    builder.quadratic_bezier_to(cp, end);
-                    last_ctrl = Some(cp);
-                    current = end;
-                }
-            }
-
-            'T' | 't' => {
-                let relative = cmd == 't';
-                while peek_num(&tokens, i) {
-                    let (x, y) = (next_num(&tokens, &mut i)?, next_num(&tokens, &mut i)?);
-                    let end = if relative {
-                        to_screen_delta(x, y, current)
-                    } else {
-                        to_screen(x, y)
-                    };
-                    let cp = match last_ctrl {
-                        Some(lc) => point(2.0 * current.x - lc.x, 2.0 * current.y - lc.y),
-                        None => current,
-                    };
-                    builder.quadratic_bezier_to(cp, end);
-                    last_ctrl = Some(cp);
-                    current = end;
-                }
-            }
-
-            'A' | 'a' => {
-                // Arc — approximate with line for now (full arc impl is complex)
-                let relative = cmd == 'a';
-                while peek_num(&tokens, i) {
-                    let _rx = next_num(&tokens, &mut i)?;
-                    let _ry = next_num(&tokens, &mut i)?;
-                    let _x_rot = next_num(&tokens, &mut i)?;
-                    let _large = next_num(&tokens, &mut i)?;
-                    let _sweep = next_num(&tokens, &mut i)?;
-                    let x = next_num(&tokens, &mut i)?;
-                    let y = next_num(&tokens, &mut i)?;
-                    let end = if relative {
-                        to_screen_delta(x, y, current)
-                    } else {
-                        to_screen(x, y)
-                    };
-                    builder.line_to(end);
-                    current = end;
-                    last_ctrl = None;
-                }
-            }
-
-            'Z' | 'z' => {
-                builder.end(true);
-                current = start;
-                in_subpath = false;
-                last_ctrl = None;
-            }
-
-            _ => {}
-        }
-    }
-
-    if in_subpath {
-        builder.end(false);
-    }
-
-    Some(builder.build())
-}
-
-// ---------------------------------------------------------------------------
-// Path tokenizer
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-enum PathToken {
-    Cmd(char),
-    Num(f32),
-}
-
-fn tokenize_path(data: &str) -> Vec<PathToken> {
-    let mut tokens = Vec::new();
-    let mut chars = data.chars().peekable();
-
-    while let Some(&c) = chars.peek() {
-        match c {
-            ' ' | '\t' | '\n' | '\r' | ',' => {
-                chars.next();
-            }
-            'A'..='Z' | 'a'..='z' => {
-                tokens.push(PathToken::Cmd(c));
-                chars.next();
-            }
-            '0'..='9' | '-' | '+' | '.' => {
-                let mut s = String::new();
-                // Handle sign
-                if c == '-' || c == '+' {
-                    s.push(c);
-                    chars.next();
-                }
-                // Integer part
-                while let Some(&d) = chars.peek() {
-                    if d.is_ascii_digit() {
-                        s.push(d);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                // Decimal part
-                if let Some(&'.') = chars.peek() {
-                    s.push('.');
-                    chars.next();
-                    while let Some(&d) = chars.peek() {
-                        if d.is_ascii_digit() {
-                            s.push(d);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                // Exponent
-                if let Some(&e) = chars.peek() {
-                    if e == 'e' || e == 'E' {
-                        s.push(e);
-                        chars.next();
-                        if let Some(&sign) = chars.peek() {
-                            if sign == '-' || sign == '+' {
-                                s.push(sign);
-                                chars.next();
-                            }
-                        }
-                        while let Some(&d) = chars.peek() {
-                            if d.is_ascii_digit() {
-                                s.push(d);
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Ok(n) = s.parse::<f32>() {
-                    tokens.push(PathToken::Num(n));
-                }
-            }
-            _ => {
-                chars.next();
-            }
-        }
-    }
-
-    tokens
-}
-
-fn next_num(tokens: &[PathToken], i: &mut usize) -> Option<f32> {
-    if let Some(PathToken::Num(n)) = tokens.get(*i) {
-        *i += 1;
-        Some(*n)
+    let fill = if !matches!(style.fill, Paint::None) {
+        tessellate_fill_raw(&lyon_path)
     } else {
         None
-    }
+    };
+
+    let stroke = if !matches!(style.stroke, Paint::None) && style.stroke_width > 0.0 {
+        tessellate_stroke_raw(&lyon_path, style.stroke_width)
+    } else {
+        None
+    };
+
+    CachedGeometry { fill, stroke }
 }
 
-fn peek_num(tokens: &[PathToken], i: usize) -> bool {
-    matches!(tokens.get(i), Some(PathToken::Num(_)))
-}
-
-// ---------------------------------------------------------------------------
-// Lyon tessellation helpers
-// ---------------------------------------------------------------------------
-
-fn tessellate_fill(path: &LyonPath, color: Color32) -> Option<egui::Shape> {
-    let mut buffers: VertexBuffers<Pos2, u32> = VertexBuffers::new();
-    let mut tessellator = FillTessellator::new();
-    tessellator
-        .tessellate_path(
-            path.as_slice(),
-            &FillOptions::default(),
-            &mut BuffersBuilder::new(&mut buffers, |v: FillVertex| {
-                Pos2::new(v.position().x, v.position().y)
-            }),
-        )
-        .ok()?;
-
-    Some(vertices_to_mesh(buffers, color))
-}
-
-fn tessellate_stroke(path: &LyonPath, stroke: Stroke) -> Option<egui::Shape> {
-    let mut buffers: VertexBuffers<Pos2, u32> = VertexBuffers::new();
-    let mut tessellator = StrokeTessellator::new();
-    tessellator
-        .tessellate_path(
-            path.as_slice(),
-            &StrokeOptions::default().with_line_width(stroke.width),
-            &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex| {
-                Pos2::new(v.position().x, v.position().y)
-            }),
-        )
-        .ok()?;
-
-    Some(vertices_to_mesh(buffers, stroke.color))
-}
-
-fn vertices_to_mesh(buffers: VertexBuffers<Pos2, u32>, color: Color32) -> egui::Shape {
-    let vertices: Vec<egui::epaint::Vertex> = buffers
-        .vertices
-        .iter()
-        .map(|&p| egui::epaint::Vertex {
-            pos: p,
-            uv: egui::epaint::WHITE_UV,
-            color,
-        })
-        .collect();
-    let indices: Vec<u32> = buffers.indices;
-
-    egui::Shape::mesh(egui::Mesh {
-        indices,
-        vertices,
-        texture_id: egui::TextureId::default(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Ellipse rendering (approximated with beziers)
-// ---------------------------------------------------------------------------
-
-fn render_ellipse(
-    ctx: &RenderContext,
-    center: Pos2,
-    rx: f32,
-    ry: f32,
-    fill: Option<Color32>,
-    stroke: Stroke,
-    highlight: bool,
-) {
-    // Approximate ellipse with 4 cubic beziers
-    const K: f32 = 0.5522847498; // 4/3 * (sqrt(2) - 1)
-    let (cx, cy) = (center.x, center.y);
-
+fn tessellate_ellipse_local(cx: f32, cy: f32, rx: f32, ry: f32, style: &Style) -> CachedGeometry {
+    const K: f32 = 0.5522847498;
     let mut builder = LyonPath::builder();
     builder.begin(point(cx + rx, cy));
     builder.cubic_bezier_to(point(cx + rx, cy - K * ry), point(cx + K * rx, cy - ry), point(cx, cy - ry));
@@ -860,91 +626,284 @@ fn render_ellipse(
     builder.end(true);
     let path = builder.build();
 
-    if let Some(fill) = fill {
-        if let Some(mesh) = tessellate_fill(&path, fill) {
-            ctx.painter.add(mesh);
+    let fill = if !matches!(style.fill, Paint::None) { tessellate_fill_raw(&path) } else { None };
+    let stroke = if !matches!(style.stroke, Paint::None) && style.stroke_width > 0.0 {
+        tessellate_stroke_raw(&path, style.stroke_width)
+    } else { None };
+
+    CachedGeometry { fill, stroke }
+}
+
+fn tessellate_polygon_local(points: &[(f32, f32)], style: &Style) -> CachedGeometry {
+    if points.len() < 2 { return CachedGeometry { fill: None, stroke: None }; }
+    let mut builder = LyonPath::builder();
+    builder.begin(point(points[0].0, points[0].1));
+    for &(x, y) in &points[1..] { builder.line_to(point(x, y)); }
+    builder.end(true);
+    let path = builder.build();
+
+    let fill = if !matches!(style.fill, Paint::None) { tessellate_fill_raw(&path) } else { None };
+    let stroke = if !matches!(style.stroke, Paint::None) && style.stroke_width > 0.0 {
+        tessellate_stroke_raw(&path, style.stroke_width)
+    } else { None };
+    CachedGeometry { fill, stroke }
+}
+
+fn tessellate_polyline_local(points: &[(f32, f32)], style: &Style) -> CachedGeometry {
+    if points.len() < 2 { return CachedGeometry { fill: None, stroke: None }; }
+    let mut builder = LyonPath::builder();
+    builder.begin(point(points[0].0, points[0].1));
+    for &(x, y) in &points[1..] { builder.line_to(point(x, y)); }
+    builder.end(false);
+    let path = builder.build();
+
+    let stroke = if !matches!(style.stroke, Paint::None) && style.stroke_width > 0.0 {
+        tessellate_stroke_raw(&path, style.stroke_width)
+    } else { None };
+    CachedGeometry { fill: None, stroke }
+}
+
+// ---------------------------------------------------------------------------
+// Lyon helpers — raw (local-space) tessellation
+// ---------------------------------------------------------------------------
+
+fn tessellate_fill_raw(path: &LyonPath) -> Option<RawMesh> {
+    let mut buffers: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+    let mut tess = FillTessellator::new();
+    tess.tessellate_path(
+        path.as_slice(),
+        &FillOptions::default(),
+        &mut BuffersBuilder::new(&mut buffers, |v: FillVertex| {
+            [v.position().x, v.position().y]
+        }),
+    ).ok()?;
+    let bounds = RawMesh::compute_bounds(&buffers.vertices);
+    Some(RawMesh { vertices: buffers.vertices, indices: buffers.indices, local_bounds: bounds })
+}
+
+fn tessellate_stroke_raw(path: &LyonPath, width: f32) -> Option<RawMesh> {
+    let mut buffers: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+    let mut tess = StrokeTessellator::new();
+    tess.tessellate_path(
+        path.as_slice(),
+        &StrokeOptions::default().with_line_width(width),
+        &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex| {
+            [v.position().x, v.position().y]
+        }),
+    ).ok()?;
+    let bounds = RawMesh::compute_bounds(&buffers.vertices);
+    Some(RawMesh { vertices: buffers.vertices, indices: buffers.indices, local_bounds: bounds })
+}
+
+// ---------------------------------------------------------------------------
+// SVG path parser — local space (no ViewTransform)
+// ---------------------------------------------------------------------------
+
+fn parse_svg_path_local(data: &str) -> Option<LyonPath> {
+    let mut builder = LyonPath::builder();
+    let mut current = Point::new(0.0, 0.0);
+    let mut start = Point::new(0.0, 0.0);
+    let mut last_ctrl: Option<Point> = None;
+    let mut in_subpath = false;
+
+    let tokens = tokenize_path(data);
+    let mut i = 0;
+
+    let abs = |x, y| point(x, y);
+    let rel = |x, y, cur: Point| point(cur.x + x, cur.y + y);
+
+    while i < tokens.len() {
+        let cmd = match &tokens[i] {
+            PathToken::Cmd(c) => { i += 1; *c }
+            PathToken::Num(_) => if in_subpath { 'L' } else { 'M' },
+        };
+
+        match cmd {
+            'M' | 'm' => {
+                let r = cmd == 'm';
+                let x = next_num(&tokens, &mut i)?;
+                let y = next_num(&tokens, &mut i)?;
+                let p = if r { rel(x, y, current) } else { abs(x, y) };
+                if in_subpath { builder.end(false); }
+                builder.begin(p);
+                current = p; start = p; in_subpath = true; last_ctrl = None;
+                while peek_num(&tokens, i) {
+                    let x2 = next_num(&tokens, &mut i)?;
+                    let y2 = next_num(&tokens, &mut i)?;
+                    let p2 = if r { rel(x2, y2, current) } else { abs(x2, y2) };
+                    builder.line_to(p2); current = p2; last_ctrl = None;
+                }
+            }
+            'L' | 'l' => {
+                let r = cmd == 'l';
+                while peek_num(&tokens, i) {
+                    let x = next_num(&tokens, &mut i)?;
+                    let y = next_num(&tokens, &mut i)?;
+                    let p = if r { rel(x, y, current) } else { abs(x, y) };
+                    if !in_subpath { builder.begin(p); in_subpath = true; start = p; }
+                    else { builder.line_to(p); }
+                    current = p; last_ctrl = None;
+                }
+            }
+            'H' | 'h' => {
+                let r = cmd == 'h';
+                while peek_num(&tokens, i) {
+                    let x = next_num(&tokens, &mut i)?;
+                    let p = point(if r { current.x + x } else { x }, current.y);
+                    builder.line_to(p); current = p; last_ctrl = None;
+                }
+            }
+            'V' | 'v' => {
+                let r = cmd == 'v';
+                while peek_num(&tokens, i) {
+                    let y = next_num(&tokens, &mut i)?;
+                    let p = point(current.x, if r { current.y + y } else { y });
+                    builder.line_to(p); current = p; last_ctrl = None;
+                }
+            }
+            'C' | 'c' => {
+                let r = cmd == 'c';
+                while peek_num(&tokens, i) {
+                    let (x1,y1,x2,y2,x,y) = (
+                        next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?,
+                        next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?,
+                        next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?,
+                    );
+                    let (cp1,cp2,ep) = if r {
+                        (rel(x1,y1,current), rel(x2,y2,current), rel(x,y,current))
+                    } else { (abs(x1,y1), abs(x2,y2), abs(x,y)) };
+                    builder.cubic_bezier_to(cp1, cp2, ep);
+                    last_ctrl = Some(cp2); current = ep;
+                }
+            }
+            'S' | 's' => {
+                let r = cmd == 's';
+                while peek_num(&tokens, i) {
+                    let (x2,y2,x,y) = (
+                        next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?,
+                        next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?,
+                    );
+                    let (cp2,ep) = if r { (rel(x2,y2,current), rel(x,y,current)) }
+                                   else { (abs(x2,y2), abs(x,y)) };
+                    let cp1 = match last_ctrl {
+                        Some(lc) => point(2.0*current.x - lc.x, 2.0*current.y - lc.y),
+                        None => current,
+                    };
+                    builder.cubic_bezier_to(cp1, cp2, ep);
+                    last_ctrl = Some(cp2); current = ep;
+                }
+            }
+            'Q' | 'q' => {
+                let r = cmd == 'q';
+                while peek_num(&tokens, i) {
+                    let (x1,y1,x,y) = (
+                        next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?,
+                        next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?,
+                    );
+                    let (cp,ep) = if r { (rel(x1,y1,current), rel(x,y,current)) }
+                                  else { (abs(x1,y1), abs(x,y)) };
+                    builder.quadratic_bezier_to(cp, ep);
+                    last_ctrl = Some(cp); current = ep;
+                }
+            }
+            'T' | 't' => {
+                let r = cmd == 't';
+                while peek_num(&tokens, i) {
+                    let (x,y) = (next_num(&tokens,&mut i)?, next_num(&tokens,&mut i)?);
+                    let ep = if r { rel(x,y,current) } else { abs(x,y) };
+                    let cp = match last_ctrl {
+                        Some(lc) => point(2.0*current.x - lc.x, 2.0*current.y - lc.y),
+                        None => current,
+                    };
+                    builder.quadratic_bezier_to(cp, ep);
+                    last_ctrl = Some(cp); current = ep;
+                }
+            }
+            'A' | 'a' => {
+                let r = cmd == 'a';
+                while peek_num(&tokens, i) {
+                    let _rx = next_num(&tokens,&mut i)?;
+                    let _ry = next_num(&tokens,&mut i)?;
+                    let _xr = next_num(&tokens,&mut i)?;
+                    let _la = next_num(&tokens,&mut i)?;
+                    let _sw = next_num(&tokens,&mut i)?;
+                    let x  = next_num(&tokens,&mut i)?;
+                    let y  = next_num(&tokens,&mut i)?;
+                    let ep = if r { rel(x,y,current) } else { abs(x,y) };
+                    builder.line_to(ep);
+                    current = ep; last_ctrl = None;
+                }
+            }
+            'Z' | 'z' => {
+                builder.end(true);
+                current = start; in_subpath = false; last_ctrl = None;
+            }
+            _ => {}
         }
     }
-    if stroke.width > 0.0 {
-        if let Some(mesh) = tessellate_stroke(&path, stroke) {
-            ctx.painter.add(mesh);
+    if in_subpath { builder.end(false); }
+    Some(builder.build())
+}
+
+// ---------------------------------------------------------------------------
+// Path tokenizer
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum PathToken { Cmd(char), Num(f32) }
+
+fn tokenize_path(data: &str) -> Vec<PathToken> {
+    let mut tokens = Vec::new();
+    let mut chars = data.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' | '\n' | '\r' | ',' => { chars.next(); }
+            'A'..='Z' | 'a'..='z' => { tokens.push(PathToken::Cmd(c)); chars.next(); }
+            '0'..='9' | '-' | '+' | '.' => {
+                let mut s = String::new();
+                if c == '-' || c == '+' { s.push(c); chars.next(); }
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                }
+                if let Some(&'.') = chars.peek() {
+                    s.push('.'); chars.next();
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                    }
+                }
+                if let Some(&e) = chars.peek() {
+                    if e == 'e' || e == 'E' {
+                        s.push(e); chars.next();
+                        if let Some(&sg) = chars.peek() {
+                            if sg == '-' || sg == '+' { s.push(sg); chars.next(); }
+                        }
+                        while let Some(&d) = chars.peek() {
+                            if d.is_ascii_digit() { s.push(d); chars.next(); } else { break; }
+                        }
+                    }
+                }
+                if let Ok(n) = s.parse::<f32>() { tokens.push(PathToken::Num(n)); }
+            }
+            _ => { chars.next(); }
         }
     }
-    if highlight {
-        if let Some(mesh) = tessellate_stroke(&path, Stroke::new(2.0, highlight_color())) {
-            ctx.painter.add(mesh);
-        }
-    }
+    tokens
 }
 
-// ---------------------------------------------------------------------------
-// Polygon fill (simple fan triangulation — works for convex polygons)
-// ---------------------------------------------------------------------------
-
-fn polygon_to_mesh(pts: &[Pos2], color: Color32) -> egui::Shape {
-    if pts.len() < 3 {
-        return egui::Shape::Noop;
-    }
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    for &p in pts {
-        vertices.push(egui::epaint::Vertex {
-            pos: p,
-            uv: egui::epaint::WHITE_UV,
-            color,
-        });
-    }
-    for i in 1..(pts.len() as u32 - 1) {
-        indices.extend_from_slice(&[0, i, i + 1]);
-    }
-    egui::Shape::mesh(egui::Mesh {
-        vertices,
-        indices,
-        texture_id: egui::TextureId::default(),
-    })
+fn next_num(tokens: &[PathToken], i: &mut usize) -> Option<f32> {
+    if let Some(PathToken::Num(n)) = tokens.get(*i) { *i += 1; Some(*n) } else { None }
 }
-
-// ---------------------------------------------------------------------------
-// Highlight overlay
-// ---------------------------------------------------------------------------
-
-pub fn highlight_color() -> Color32 {
-    Color32::from_rgba_unmultiplied(30, 120, 255, 180)
-}
-
-fn draw_highlight_rect(ctx: &RenderContext, rect: Rect) {
-    ctx.painter.rect(
-        rect,
-        egui::CornerRadius::ZERO,
-        Color32::from_rgba_unmultiplied(30, 120, 255, 40),
-        Stroke::new(2.0, highlight_color()),
-        StrokeKind::Middle,
-    );
-}
-
-fn draw_highlight_circle(ctx: &RenderContext, center: Pos2, r: f32) {
-    ctx.painter.circle(
-        center,
-        r,
-        Color32::from_rgba_unmultiplied(30, 120, 255, 40),
-        Stroke::new(2.0, highlight_color()),
-    );
+fn peek_num(tokens: &[PathToken], i: usize) -> bool {
+    matches!(tokens.get(i), Some(PathToken::Num(_)))
 }
 
 // ---------------------------------------------------------------------------
 // Transform helpers
 // ---------------------------------------------------------------------------
 
-fn apply_transform(t: &Transform, x: f32, y: f32) -> (f32, f32) {
-    t.apply(x, y)
-}
-
-fn transform_scale_x(t: &Transform) -> f32 {
-    let [a, b, ..] = t.matrix;
-    (a * a + b * b).sqrt()
-}
-
-fn transform_scale_y(t: &Transform) -> f32 {
-    let [_, _, c, d, ..] = t.matrix;
-    (c * c + d * d).sqrt()
+fn transform_max_scale(t: &Transform) -> f32 {
+    let [a, b, c, d, ..] = t.matrix;
+    let sx = (a * a + b * b).sqrt();
+    let sy = (c * c + d * d).sqrt();
+    sx.max(sy)
 }

@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use egui::{CentralPanel, Color32, Context, Key, Rect, Sense, SidePanel, TextureHandle, TopBottomPanel, Vec2};
 
 use crate::elements_pane::ElementsPane;
-use crate::renderer::{RenderContext, ViewTransform};
+use crate::renderer::{GeometryCache, RenderContext, ViewTransform};
+use crate::spatial_index::SpatialIndex;
 use crate::svg_doc::{NodeId, SvgDocument, SvgNodeKind, SvgShape};
 use crate::{parser, renderer};
 
@@ -42,6 +43,12 @@ pub struct SvgViewerApp {
     // --- Elements pane ---
     elements_pane: ElementsPane,
 
+    // --- Spatial index ---
+    /// Built once per document load; used for all hit-testing
+    spatial_index: Option<SpatialIndex>,
+    /// Tessellation cache — built once per load, reused every frame
+    geometry_cache: GeometryCache,
+
     // --- Image textures ---
     /// Textures uploaded to egui for <image> nodes, keyed by NodeId
     textures: HashMap<NodeId, TextureHandle>,
@@ -65,6 +72,8 @@ impl SvgViewerApp {
             panning: false,
             last_drag_pos: None,
             elements_pane: ElementsPane::new(),
+            spatial_index: None,
+            geometry_cache: GeometryCache::new(),
             textures: HashMap::new(),
             egui_ctx: None,
         }
@@ -79,7 +88,12 @@ impl SvgViewerApp {
                     parser::resolve_external_images(&mut doc, svg_dir.as_deref());
 
                     self.textures.clear();
-                    // Schedule texture upload on next frame (needs egui context)
+                    // Build spatial index and geometry cache
+                    let index = SpatialIndex::build(&doc);
+                    let cache = GeometryCache::build(&doc);
+                    log::info!("Spatial index + geometry cache built for {} nodes", doc.nodes.len());
+                    self.spatial_index = Some(index);
+                    self.geometry_cache = cache;
                     self.doc = Some(doc);
                     self.file_path = Some(path);
                     self.error = None;
@@ -153,11 +167,6 @@ impl SvgViewerApp {
         }
     }
 
-    /// Hit-test: find the topmost visible element at SVG-space point (sx, sy).
-    /// Uses a simple back-to-front walk for now; M5 will replace with R-tree.
-    fn hit_test(&self, doc: &SvgDocument, sx: f32, sy: f32) -> Option<NodeId> {
-        hit_test_node(doc, doc.root, sx, sy, &crate::svg_doc::Transform::identity())
-    }
 }
 
 impl eframe::App for SvgViewerApp {
@@ -356,10 +365,13 @@ impl eframe::App for SvgViewerApp {
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if let Some(doc) = &self.doc {
                         let (sx, sy) = self.view.screen_to_svg(hover_pos);
-                        if let Some(hit) = self.hit_test(doc, sx, sy) {
+                        let hit = self
+                            .spatial_index
+                            .as_ref()
+                            .and_then(|idx| idx.hit_test_precise(doc, sx, sy));
+                        if let Some(hit) = hit {
                             if self.highlighted != Some(hit) {
                                 self.highlighted = Some(hit);
-                                // Tell elements pane to scroll to this node
                                 let doc_ptr = doc as *const SvgDocument;
                                 let doc_ref = unsafe { &*doc_ptr };
                                 self.elements_pane.select_and_scroll(hit, doc_ref);
@@ -382,8 +394,10 @@ impl eframe::App for SvgViewerApp {
                     doc,
                     vt: &self.view,
                     painter: &painter,
+                    viewport: rect,
                     highlight: self.highlighted,
                     textures: &self.textures,
+                    cache: &self.geometry_cache,
                 };
                 renderer::render(&render_ctx);
             }
@@ -396,157 +410,4 @@ impl eframe::App for SvgViewerApp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Simple recursive hit-tester (no spatial index yet — replaced in M5)
-// ---------------------------------------------------------------------------
 
-fn hit_test_node(
-    doc: &SvgDocument,
-    node_id: NodeId,
-    sx: f32,
-    sy: f32,
-    parent_transform: &crate::svg_doc::Transform,
-) -> Option<NodeId> {
-    let node = doc.get(node_id);
-    let combined = parent_transform.concat(&node.transform);
-
-    match &node.kind {
-        crate::svg_doc::SvgNodeKind::Svg { .. }
-        | crate::svg_doc::SvgNodeKind::Group => {
-            // Walk children back-to-front, return first (topmost) hit
-            for &child in node.children.iter().rev() {
-                if let Some(hit) = hit_test_node(doc, child, sx, sy, &combined) {
-                    return Some(hit);
-                }
-            }
-            None
-        }
-        crate::svg_doc::SvgNodeKind::Shape(shape) => {
-            if shape_hit_test(shape, &combined, sx, sy) {
-                Some(node_id)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn shape_hit_test(
-    shape: &crate::svg_doc::SvgShape,
-    transform: &crate::svg_doc::Transform,
-    sx: f32,
-    sy: f32,
-) -> bool {
-    use crate::svg_doc::SvgShape;
-
-    // Transform the test point into the element's local space
-    // (approximate inverse for uniform-ish transforms)
-    let (lx, ly) = inverse_transform_point(transform, sx, sy);
-
-    match shape {
-        SvgShape::Rect { x, y, width, height, .. } => {
-            lx >= *x && lx <= x + width && ly >= *y && ly <= y + height
-        }
-        SvgShape::Circle { cx, cy, r } => {
-            let dx = lx - cx;
-            let dy = ly - cy;
-            dx * dx + dy * dy <= r * r
-        }
-        SvgShape::Ellipse { cx, cy, rx, ry } => {
-            if *rx == 0.0 || *ry == 0.0 {
-                return false;
-            }
-            let dx = (lx - cx) / rx;
-            let dy = (ly - cy) / ry;
-            dx * dx + dy * dy <= 1.0
-        }
-        SvgShape::Line { x1, y1, x2, y2 } => {
-            // Point within ~4 units of the line
-            point_to_segment_dist(lx, ly, *x1, *y1, *x2, *y2) < 4.0
-        }
-        SvgShape::Path { data } => {
-            // Bounding box hit test only — precise test deferred to M5
-            path_bbox_hit(data, lx, ly)
-        }
-        SvgShape::Polyline { points } | SvgShape::Polygon { points } => {
-            if points.is_empty() {
-                return false;
-            }
-            // Bounding box test
-            let min_x = points.iter().map(|(x, _)| *x).fold(f32::INFINITY, f32::min);
-            let max_x = points.iter().map(|(x, _)| *x).fold(f32::NEG_INFINITY, f32::max);
-            let min_y = points.iter().map(|(_, y)| *y).fold(f32::INFINITY, f32::min);
-            let max_y = points.iter().map(|(_, y)| *y).fold(f32::NEG_INFINITY, f32::max);
-            lx >= min_x && lx <= max_x && ly >= min_y && ly <= max_y
-        }
-        SvgShape::Text { x, y, spans, font_size } => {
-            // Approximate bounding box across all spans
-            let total_chars: usize = spans.iter().map(|s| s.content.len()).sum();
-            let w = total_chars as f32 * font_size * 0.6;
-            let h = *font_size;
-            lx >= *x && lx <= x + w && ly >= y - h && ly <= *y
-        }
-        SvgShape::Image { x, y, width, height, .. } => {
-            lx >= *x && lx <= x + width && ly >= *y && ly <= y + height
-        }
-        SvgShape::Use { .. } => false,
-    }
-}
-
-fn inverse_transform_point(t: &crate::svg_doc::Transform, x: f32, y: f32) -> (f32, f32) {
-    // Compute inverse of 2D affine matrix
-    let [a, b, c, d, e, f] = t.matrix;
-    let det = a * d - b * c;
-    if det.abs() < 1e-10 {
-        return (x, y);
-    }
-    let inv_det = 1.0 / det;
-    let ia = d * inv_det;
-    let ib = -b * inv_det;
-    let ic = -c * inv_det;
-    let id = a * inv_det;
-    let ie = (c * f - d * e) * inv_det;
-    let if_ = (b * e - a * f) * inv_det;
-    (ia * x + ic * y + ie, ib * x + id * y + if_)
-}
-
-fn point_to_segment_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let dx = bx - ax;
-    let dy = by - ay;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-10 {
-        let dpx = px - ax;
-        let dpy = py - ay;
-        return (dpx * dpx + dpy * dpy).sqrt();
-    }
-    let t = ((px - ax) * dx + (py - ay) * dy) / len_sq;
-    let t = t.clamp(0.0, 1.0);
-    let qx = ax + t * dx;
-    let qy = ay + t * dy;
-    let dpx = px - qx;
-    let dpy = py - qy;
-    (dpx * dpx + dpy * dpy).sqrt()
-}
-
-fn path_bbox_hit(data: &str, lx: f32, ly: f32) -> bool {
-    // Quick scan of path data numbers to get approximate bounding box
-    let nums: Vec<f32> = data
-        .split(|c: char| c == ',' || c.is_ascii_whitespace())
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    if nums.len() < 2 {
-        return false;
-    }
-    // Separate x/y coords (rough — every other number, starting from first pair)
-    let xs: Vec<f32> = nums.iter().copied().step_by(2).collect();
-    let ys: Vec<f32> = nums.iter().skip(1).copied().step_by(2).collect();
-    let min_x = xs.iter().copied().fold(f32::INFINITY, f32::min);
-    let max_x = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let min_y = ys.iter().copied().fold(f32::INFINITY, f32::min);
-    let max_y = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-
-    // Add some tolerance
-    let pad = 4.0;
-    lx >= min_x - pad && lx <= max_x + pad && ly >= min_y - pad && ly <= max_y + pad
-}
