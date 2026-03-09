@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use egui::{CentralPanel, Color32, Context, Key, Rect, Sense, SidePanel, TextureHandle, TopBottomPanel, Vec2};
 use egui::epaint::StrokeKind;
 
+use crate::clip_index::ClipIndex;
 use crate::elements_pane::ElementsPane;
 use crate::renderer::{GeometryCache, RenderContext, ViewTransform};
 use crate::spatial_index::SpatialIndex;
@@ -73,6 +74,8 @@ pub struct SvgViewerApp {
     spatial_index: Option<SpatialIndex>,
     /// Tessellation cache — built once per load, reused every frame
     geometry_cache: GeometryCache,
+    /// Clip-path AABB index — built once per load
+    clip_index: ClipIndex,
 
     // --- Image textures ---
     /// Textures uploaded to egui for <image> nodes, keyed by NodeId
@@ -107,6 +110,7 @@ impl SvgViewerApp {
             last_viewport: None,
             spatial_index: None,
             geometry_cache: GeometryCache::new(),
+            clip_index: ClipIndex { clips: std::collections::HashMap::new() },
             textures: HashMap::new(),
             egui_ctx: None,
         }
@@ -121,12 +125,14 @@ impl SvgViewerApp {
                     parser::resolve_external_images(&mut doc, svg_dir.as_deref());
 
                     self.textures.clear();
-                    // Build spatial index and geometry cache
+                    // Build spatial index, geometry cache, and clip index
                     let index = SpatialIndex::build(&doc);
                     let cache = GeometryCache::build(&doc);
-                    log::info!("Spatial index + geometry cache built for {} nodes", doc.nodes.len());
+                    let clips = ClipIndex::build(&doc);
+                    log::info!("Spatial index + geometry cache + clip index built for {} nodes", doc.nodes.len());
                     self.spatial_index = Some(index);
                     self.geometry_cache = cache;
+                    self.clip_index = clips;
                     self.doc = Some(doc);
                     self.file_path = Some(path);
                     self.error = None;
@@ -593,6 +599,7 @@ impl eframe::App for SvgViewerApp {
                     group_highlight_bbox: self.group_highlight_bbox,
                     textures: &self.textures,
                     cache: &self.geometry_cache,
+                    clips: &self.clip_index,
                 };
                 renderer::render(&render_ctx);
             }

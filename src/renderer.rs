@@ -10,6 +10,7 @@
 use egui::{Color32, Painter, Pos2, Rect, Stroke, TextureHandle};
 use egui::epaint::StrokeKind;
 use std::collections::HashMap;
+use crate::clip_index::ClipIndex;
 use lyon::geom::point;
 use lyon::math::Point;
 use lyon::path::Path as LyonPath;
@@ -224,6 +225,7 @@ pub struct RenderContext<'a> {
     pub group_highlight_bbox: Option<[f32; 4]>,
     pub textures: &'a HashMap<NodeId, TextureHandle>,
     pub cache: &'a GeometryCache,
+    pub clips: &'a ClipIndex,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +257,51 @@ pub fn render(ctx: &RenderContext) {
 fn render_node(ctx: &RenderContext, node_id: NodeId, parent_tf: &Transform) {
     let node = ctx.doc.get(node_id);
     let world = parent_tf.concat(&node.transform);
+
+    // If this node references a clipPath, restrict the painter to its screen-space AABB.
+    // We build a clipped painter and a derived RenderContext that uses it.
+    // The clip AABB is in local SVG space (clipPathUnits=userSpaceOnUse default),
+    // so we transform it using this node's accumulated world transform.
+    let clipped_painter;
+    let clipped_ctx;
+    let ctx: &RenderContext = if let Some(clip_id) = &node.clip_path {
+        if let Some(local_bb) = ctx.clips.get(clip_id) {
+            let [lx0, ly0, lx1, ly1] = local_bb;
+            // Transform all four corners of the clip AABB to screen space.
+            let corners = [
+                ctx.vt.world_to_screen(&world, lx0, ly0),
+                ctx.vt.world_to_screen(&world, lx1, ly0),
+                ctx.vt.world_to_screen(&world, lx0, ly1),
+                ctx.vt.world_to_screen(&world, lx1, ly1),
+            ];
+            let min_x = corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+            let min_y = corners.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+            let max_x = corners.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+            let max_y = corners.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+            let clip_screen = Rect::from_min_max(
+                egui::pos2(min_x, min_y),
+                egui::pos2(max_x, max_y),
+            ).intersect(ctx.viewport);
+
+            clipped_painter = ctx.painter.with_clip_rect(clip_screen);
+            clipped_ctx = RenderContext {
+                doc: ctx.doc,
+                vt: ctx.vt,
+                painter: &clipped_painter,
+                viewport: clip_screen,
+                highlight: ctx.highlight,
+                group_highlight_bbox: ctx.group_highlight_bbox,
+                textures: ctx.textures,
+                cache: ctx.cache,
+                clips: ctx.clips,
+            };
+            &clipped_ctx
+        } else {
+            ctx
+        }
+    } else {
+        ctx
+    };
 
     match &node.kind {
         SvgNodeKind::Svg { .. } | SvgNodeKind::Group => {

@@ -40,12 +40,19 @@ pub fn parse_svg(source: &str) -> Result<SvgDocument> {
         _ => (800.0, 600.0, None),
     };
 
+    // Build id → NodeId map for all nodes that carry an SVG id attribute
+    let defs_by_id = nodes
+        .iter()
+        .filter_map(|n| n.svg_id.as_ref().map(|id| (id.clone(), n.id)))
+        .collect();
+
     Ok(SvgDocument {
         nodes,
         root: root_id,
         width,
         height,
         view_box,
+        defs_by_id,
     })
 }
 

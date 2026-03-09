@@ -265,6 +265,8 @@ pub struct SvgDocument {
     pub height: f32,
     /// viewBox if specified
     pub view_box: Option<[f32; 4]>,
+    /// Map from SVG id attribute → NodeId, for resolving url(#id) references
+    pub defs_by_id: std::collections::HashMap<String, NodeId>,
 }
 
 impl SvgDocument {
