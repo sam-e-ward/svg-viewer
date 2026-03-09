@@ -1,0 +1,47 @@
+[package]
+name = "svg_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "svg_viewer"
+path = "src/main.rs"
+
+[dependencies]
+# GUI framework
+eframe = { version = "0.31", features = ["wgpu"] }
+egui = "0.31"
+egui_extras = "0.31"
+
+# SVG / XML parsing
+roxmltree = "0.20"
+
+# Path math & tessellation
+lyon = "1.0"
+
+# Spatial indexing for hit-testing
+rstar = "0.12"
+
+# File dialog
+rfd = "0.15"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Image decoding (for <image> elements)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+# Base64 decoding for data URIs
+base64 = "0.22"
+
+# Misc
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
