@@ -24,19 +24,20 @@ impl ElementsPane {
     }
 
     /// Main render function — call inside a panel or frame.
-    /// Returns the NodeId if the user clicked a row.
-    pub fn show(&mut self, ui: &mut Ui, doc: &SvgDocument) -> Option<NodeId> {
+    /// Returns `(clicked, hovered)` NodeIds for this frame.
+    pub fn show(&mut self, ui: &mut Ui, doc: &SvgDocument) -> (Option<NodeId>, Option<NodeId>) {
         let mut clicked = None;
+        let mut hovered = None;
 
         egui::ScrollArea::vertical()
             .id_salt("elements_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.style_mut().spacing.item_spacing.y = 1.0;
-                self.show_node(ui, doc, doc.root, 0, &mut clicked);
+                self.show_node(ui, doc, doc.root, 0, &mut clicked, &mut hovered);
             });
 
-        clicked
+        (clicked, hovered)
     }
 
     fn show_node(
@@ -46,6 +47,7 @@ impl ElementsPane {
         node_id: NodeId,
         depth: usize,
         clicked: &mut Option<NodeId>,
+        hovered: &mut Option<NodeId>,
     ) {
         let node = doc.get(node_id);
         let is_leaf = node.children.is_empty();
@@ -134,6 +136,10 @@ impl ElementsPane {
             );
         }
 
+        if response.hovered() {
+            *hovered = Some(node_id);
+        }
+
         if response.clicked() {
             *clicked = Some(node_id);
             self.selected = Some(node_id);
@@ -148,12 +154,12 @@ impl ElementsPane {
 
         // Recurse into children if not collapsed
         if !is_collapsed && is_container {
-            for &child in &node.children {
-                self.show_node(ui, doc, child, depth + 1, clicked);
+            for &child in &node.children.clone() {
+                self.show_node(ui, doc, child, depth + 1, clicked, hovered);
             }
         } else if !is_collapsed && !is_leaf {
-            for &child in &node.children {
-                self.show_node(ui, doc, child, depth + 1, clicked);
+            for &child in &node.children.clone() {
+                self.show_node(ui, doc, child, depth + 1, clicked, hovered);
             }
         }
     }

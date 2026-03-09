@@ -6,12 +6,20 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use egui::{CentralPanel, Color32, Context, Key, Rect, Sense, SidePanel, TextureHandle, TopBottomPanel, Vec2};
+use egui::epaint::StrokeKind;
 
 use crate::elements_pane::ElementsPane;
 use crate::renderer::{GeometryCache, RenderContext, ViewTransform};
 use crate::spatial_index::SpatialIndex;
 use crate::svg_doc::{NodeId, SvgDocument, SvgNodeKind, SvgShape};
 use crate::{parser, renderer};
+
+/// Which pane currently owns keyboard focus / spacebar behaviour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ActivePane {
+    Viewer,
+    Elements,
+}
 
 /// Minimum scale (zoom out limit)
 const MIN_SCALE: f32 = 0.01;
@@ -32,16 +40,33 @@ pub struct SvgViewerApp {
     view_fitted: bool,
 
     // --- Interaction state ---
+    /// Which pane has focus for spacebar / keyboard interactions
+    active_pane: ActivePane,
+    /// Set to true on the frame a pane-activation click is consumed,
+    /// so content logic in that pane is skipped for that frame.
+    activation_consumed: bool,
     /// True while spacebar is held
     spacebar_held: bool,
-    /// Currently highlighted element (from spacebar hover)
+    /// Currently highlighted element (from spacebar hover or click)
     highlighted: Option<NodeId>,
+    /// True if `highlighted` was set by spacebar-hover (transient); false if set by a click (sticky)
+    highlight_transient: bool,
+    /// World-space bbox for a hovered/clicked group in the elements pane
+    group_highlight_bbox: Option<[f32; 4]>,
+    /// All elements under the last spacebar-hover position, topmost first (for TAB cycling)
+    tab_candidates: Vec<NodeId>,
+    /// Index into `tab_candidates` — which element is currently selected by TAB
+    tab_index: usize,
+    /// The SVG-space cursor position when `tab_candidates` was last built
+    tab_cursor_pos: Option<(f32, f32)>,
     /// True if we're currently panning (dragging)
     panning: bool,
     last_drag_pos: Option<egui::Pos2>,
 
     // --- Elements pane ---
     elements_pane: ElementsPane,
+    /// Viewport rect from the previous frame (for click-to-zoom from elements pane)
+    last_viewport: Option<Rect>,
 
     // --- Spatial index ---
     /// Built once per document load; used for all hit-testing
@@ -67,11 +92,19 @@ impl SvgViewerApp {
                 scale: 1.0,
             },
             view_fitted: false,
+            active_pane: ActivePane::Viewer,
+            activation_consumed: false,
             spacebar_held: false,
             highlighted: None,
+            highlight_transient: false,
+            group_highlight_bbox: None,
+            tab_candidates: Vec::new(),
+            tab_index: 0,
+            tab_cursor_pos: None,
             panning: false,
             last_drag_pos: None,
             elements_pane: ElementsPane::new(),
+            last_viewport: None,
             spatial_index: None,
             geometry_cache: GeometryCache::new(),
             textures: HashMap::new(),
@@ -99,6 +132,11 @@ impl SvgViewerApp {
                     self.error = None;
                     self.view_fitted = false;
                     self.highlighted = None;
+                    self.highlight_transient = false;
+                    self.group_highlight_bbox = None;
+                    self.tab_candidates.clear();
+                    self.tab_index = 0;
+                    self.tab_cursor_pos = None;
                     self.elements_pane = ElementsPane::new();
                 }
                 Err(e) => {
@@ -167,6 +205,36 @@ impl SvgViewerApp {
         }
     }
 
+    /// Pan and zoom the viewer so that the given world-space bbox
+    /// `[min_x, min_y, max_x, max_y]` is centered with a small margin.
+    fn zoom_to_bbox(&mut self, bbox: [f32; 4]) {
+        let viewport = match self.last_viewport {
+            Some(r) => r,
+            None => return,
+        };
+
+        let [min_x, min_y, max_x, max_y] = bbox;
+        let w = (max_x - min_x).max(1.0);
+        let h = (max_y - min_y).max(1.0);
+        let margin = 0.15; // 15% padding on each side
+
+        let scale_x = viewport.width() / (w * (1.0 + 2.0 * margin));
+        let scale_y = viewport.height() / (h * (1.0 + 2.0 * margin));
+        let scale = scale_x.min(scale_y).clamp(MIN_SCALE, MAX_SCALE);
+
+        let cx_svg = (min_x + max_x) / 2.0;
+        let cy_svg = (min_y + max_y) / 2.0;
+
+        // After applying scale, the SVG center should map to the viewport center.
+        // screen = svg * scale + offset  →  offset = screen_center - svg_center * scale
+        self.view.scale = scale;
+        self.view.offset = egui::Vec2::new(
+            viewport.center().x - cx_svg * scale,
+            viewport.center().y - cy_svg * scale,
+        );
+        self.view_fitted = true; // suppress fit-on-load next frame
+    }
+
 }
 
 impl eframe::App for SvgViewerApp {
@@ -232,9 +300,49 @@ impl eframe::App for SvgViewerApp {
         });
 
         // -- Keyboard state --
+        let prev_spacebar = self.spacebar_held;
         ctx.input(|i| {
             self.spacebar_held = i.key_down(Key::Space);
         });
+        // When spacebar is held, consume Tab before egui can use it for focus traversal.
+        // Capture whether it was pressed this frame, then consume it unconditionally.
+        let tab_pressed_this_frame = self.spacebar_held && ctx.input(|i| i.key_pressed(Key::Tab));
+        if self.spacebar_held {
+            ctx.input_mut(|i| { i.consume_key(egui::Modifiers::NONE, Key::Tab); });
+        }
+        // When spacebar is released, clear any transient hover-highlight
+        if prev_spacebar && !self.spacebar_held && self.highlight_transient {
+            self.highlighted = None;
+            self.highlight_transient = false;
+        }
+
+        // -- Active pane: resolve pointer-down before panels are drawn --
+        // We read the pointer position and check which pane rect it falls in.
+        // last_viewport holds the viewer rect from the previous frame (good enough for
+        // one-frame lag — pane rects don't move between frames in practice).
+        // The elements panel occupies the right side; everything else is the viewer.
+        self.activation_consumed = false;
+        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
+        if primary_pressed {
+            if let Some(pos) = ctx.input(|i| i.pointer.press_origin()) {
+                // Determine which pane the click landed in.
+                // We use last_viewport (viewer rect). If the click is outside it, it's elements.
+                let in_viewer = self.last_viewport.map(|r| r.contains(pos)).unwrap_or(false);
+                let target = if in_viewer { ActivePane::Viewer } else { ActivePane::Elements };
+                if target != self.active_pane {
+                    self.active_pane = target;
+                    self.activation_consumed = true;
+                    // Clear transient state when switching panes
+                    if self.highlight_transient {
+                        self.highlighted = None;
+                        self.highlight_transient = false;
+                    }
+                    self.tab_candidates.clear();
+                    self.tab_index = 0;
+                    self.tab_cursor_pos = None;
+                }
+            }
+        }
 
         // -- Drop file support --
         ctx.input(|i| {
@@ -246,7 +354,7 @@ impl eframe::App for SvgViewerApp {
         });
 
         // -- Right: elements pane --
-        SidePanel::right("elements_panel")
+        let elements_response = SidePanel::right("elements_panel")
             .resizable(true)
             .default_width(400.0)
             .min_width(200.0)
@@ -257,28 +365,67 @@ impl eframe::App for SvgViewerApp {
                     ui.separator();
 
                     if let Some(doc) = &self.doc {
-                        // Clone the highlight state so we can pass to show()
-                        let mouse_in_elements = ui.rect_contains_pointer(ui.max_rect());
-
-                        if self.spacebar_held && mouse_in_elements {
-                            // FR-6: hover over elements pane → highlight in viewer
-                            if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                                // We'll resolve which node is under the mouse
-                                // in a future milestone with proper row tracking.
-                                // For M1 the spacebar just keeps the selection visible.
-                                let _ = hover_pos;
-                            }
-                        }
-
                         // We need a mutable borrow of elements_pane and immutable doc.
                         // Temporarily take the doc out to satisfy borrow checker.
                         let doc_ref = doc as *const SvgDocument;
                         let doc_ref = unsafe { &*doc_ref };
 
-                        if let Some(clicked) = self.elements_pane.show(ui, doc_ref) {
-                            // Element clicked → highlight it
-                            self.highlighted = Some(clicked);
-                            // TODO M6: scroll viewer to element bbox
+                        let (clicked, hovered) = self.elements_pane.show(ui, doc_ref);
+
+                        // Update group bbox highlight based on what's hovered (no spacebar needed)
+                        self.group_highlight_bbox = None;
+                        if let Some(h) = hovered {
+                            let is_group = matches!(
+                                doc_ref.get(h).kind,
+                                SvgNodeKind::Group | SvgNodeKind::Svg { .. }
+                                    | SvgNodeKind::Defs | SvgNodeKind::ClipPath { .. }
+                                    | SvgNodeKind::Mask { .. }
+                            );
+                            if is_group {
+                                self.group_highlight_bbox = self.spatial_index
+                                    .as_ref()
+                                    .and_then(|idx| idx.bbox_for_subtree(doc_ref, h));
+                            }
+                        }
+
+                        // Spacebar + hover → highlight leaf in viewer (only when Elements is active)
+                        if self.spacebar_held && self.active_pane == ActivePane::Elements {
+                            if let Some(h) = hovered {
+                                let is_leaf = matches!(doc_ref.get(h).kind, SvgNodeKind::Shape(_));
+                                if is_leaf {
+                                    self.highlighted = Some(h);
+                                    self.highlight_transient = true;
+                                }
+                            }
+                        }
+
+                        // Click → highlight + zoom (suppressed on activation frame)
+                        if !self.activation_consumed {
+                            if let Some(clicked_id) = clicked {
+                                let is_group = matches!(
+                                    doc_ref.get(clicked_id).kind,
+                                    SvgNodeKind::Group | SvgNodeKind::Svg { .. }
+                                        | SvgNodeKind::Defs | SvgNodeKind::ClipPath { .. }
+                                        | SvgNodeKind::Mask { .. }
+                                );
+                                if is_group {
+                                    if let Some(idx) = &self.spatial_index {
+                                        if let Some(bbox) = idx.bbox_for_subtree(doc_ref, clicked_id) {
+                                            self.group_highlight_bbox = Some(bbox);
+                                            self.zoom_to_bbox(bbox);
+                                        }
+                                    }
+                                } else {
+                                    self.highlighted = Some(clicked_id);
+                                    self.highlight_transient = false;
+                                    self.group_highlight_bbox = None;
+                                    if let Some(idx) = &self.spatial_index {
+                                        if let Some(bbox) = idx.bbox_for_node(clicked_id) {
+                                            self.zoom_to_bbox(bbox);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     } else if self.error.is_some() {
                         // Error shown in main panel
@@ -294,9 +441,18 @@ impl eframe::App for SvgViewerApp {
                 });
             });
 
+        // Draw active-pane outline on the elements panel
+        if self.active_pane == ActivePane::Elements {
+            let outline_color = Color32::from_rgb(30, 120, 255);
+            ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("elements_outline")))
+                .rect_stroke(elements_response.response.rect, egui::CornerRadius::ZERO,
+                    egui::Stroke::new(2.0, outline_color), StrokeKind::Inside);
+        }
+
         // -- Left: SVG viewer --
         CentralPanel::default().show(ctx, |ui| {
             let viewport = ui.max_rect();
+            self.last_viewport = Some(viewport);
 
             // Fit on first load
             if !self.view_fitted && self.doc.is_some() {
@@ -360,25 +516,63 @@ impl eframe::App for SvgViewerApp {
                 self.panning = false;
             }
 
-            // -- Spacebar hover → hit-test (FR-5) --
-            if self.spacebar_held && response.hovered() {
+            // -- Spacebar hover → hit-test (FR-5) + TAB cycling (only when Viewer is active) --
+            if self.spacebar_held && self.active_pane == ActivePane::Viewer && response.hovered() {
+                let tab_pressed = tab_pressed_this_frame;
+
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if let Some(doc) = &self.doc {
                         let (sx, sy) = self.view.screen_to_svg(hover_pos);
-                        let hit = self
-                            .spatial_index
-                            .as_ref()
-                            .and_then(|idx| idx.hit_test_precise(doc, sx, sy));
-                        if let Some(hit) = hit {
+
+                        // Rebuild candidate list if cursor moved significantly
+                        let cursor_moved = self.tab_cursor_pos
+                            .map(|(px, py)| {
+                                let dx = sx - px;
+                                let dy = sy - py;
+                                // Threshold: 2 SVG units, scaled by view
+                                (dx * dx + dy * dy) > (2.0 / self.view.scale).powi(2)
+                            })
+                            .unwrap_or(true);
+
+                        if cursor_moved {
+                            let doc_ptr = doc as *const SvgDocument;
+                            let doc_ref = unsafe { &*doc_ptr };
+                            self.tab_candidates = self
+                                .spatial_index
+                                .as_ref()
+                                .map(|idx| idx.hit_test_all(doc_ref, sx, sy))
+                                .unwrap_or_default();
+                            self.tab_index = 0;
+                            self.tab_cursor_pos = Some((sx, sy));
+                        }
+
+                        // TAB advances the cycle index
+                        if tab_pressed && !self.tab_candidates.is_empty() {
+                            self.tab_index = (self.tab_index + 1) % self.tab_candidates.len();
+                        }
+
+                        if let Some(&hit) = self.tab_candidates.get(self.tab_index) {
                             if self.highlighted != Some(hit) {
                                 self.highlighted = Some(hit);
+                                self.highlight_transient = true;
                                 let doc_ptr = doc as *const SvgDocument;
                                 let doc_ref = unsafe { &*doc_ptr };
                                 self.elements_pane.select_and_scroll(hit, doc_ref);
                             }
+                        } else {
+                            // Nothing under cursor — clear transient highlight
+                            if self.highlight_transient {
+                                self.highlighted = None;
+                            }
+                            self.tab_cursor_pos = None;
                         }
                     }
                 }
+            } else if !self.spacebar_held {
+                // Spacebar released — reset TAB state
+                self.tab_candidates.clear();
+                self.tab_index = 0;
+                self.tab_cursor_pos = None;
             }
 
             // Upload any pending image textures
@@ -396,6 +590,7 @@ impl eframe::App for SvgViewerApp {
                     painter: &painter,
                     viewport: rect,
                     highlight: self.highlighted,
+                    group_highlight_bbox: self.group_highlight_bbox,
                     textures: &self.textures,
                     cache: &self.geometry_cache,
                 };
@@ -403,8 +598,16 @@ impl eframe::App for SvgViewerApp {
             }
 
             // Cursor hint
-            if self.spacebar_held {
+            if self.spacebar_held && self.active_pane == ActivePane::Viewer {
                 ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+
+            // Draw active-pane outline on viewer
+            if self.active_pane == ActivePane::Viewer {
+                let outline_color = Color32::from_rgb(30, 120, 255);
+                ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("viewer_outline")))
+                    .rect_stroke(rect, egui::CornerRadius::ZERO,
+                        egui::Stroke::new(2.0, outline_color), StrokeKind::Inside);
             }
         });
     }

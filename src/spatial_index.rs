@@ -77,34 +77,74 @@ impl SpatialIndex {
         }
     }
 
+    /// Return the union world-space AABB of all leaf descendants of `node_id`.
+    /// Used to draw a bounding box for `<g>` elements.
+    pub fn bbox_for_subtree(&self, doc: &SvgDocument, node_id: NodeId) -> Option<[f32; 4]> {
+        let mut descendants = Vec::new();
+        collect_leaf_ids(doc, node_id, &mut descendants);
+        let mut result: Option<[f32; 4]> = None;
+        for leaf_id in descendants {
+            if let Some(bb) = self.bbox_for_node(leaf_id) {
+                result = Some(match result {
+                    None => bb,
+                    Some([ax, ay, ax2, ay2]) => [
+                        ax.min(bb[0]), ay.min(bb[1]),
+                        ax2.max(bb[2]), ay2.max(bb[3]),
+                    ],
+                });
+            }
+        }
+        result
+    }
+
+    /// Return the world-space AABB `[min_x, min_y, max_x, max_y]` for a given
+    /// node, if it exists in the index.
+    pub fn bbox_for_node(&self, node_id: NodeId) -> Option<[f32; 4]> {
+        self.entries_by_paint_order
+            .iter()
+            .find(|e| e.node_id == node_id)
+            .map(|e| {
+                let lo = e.aabb.lower();
+                let hi = e.aabb.upper();
+                [lo[0], lo[1], hi[0], hi[1]]
+            })
+    }
+
     /// Full precise hit-test: returns the topmost NodeId where the point is
     /// geometrically inside the shape (not just inside the AABB).
     pub fn hit_test_precise(&self, doc: &SvgDocument, sx: f32, sy: f32) -> Option<NodeId> {
+        self.hit_test_all(doc, sx, sy).into_iter().next()
+    }
+
+    /// Returns all NodeIds precisely hit at `(sx, sy)`, sorted topmost-first
+    /// (descending paint order). Used for TAB-cycling through stacked elements.
+    pub fn hit_test_all(&self, doc: &SvgDocument, sx: f32, sy: f32) -> Vec<NodeId> {
         let point = [sx, sy];
 
-        // Gather R-tree candidates
         let mut candidates: Vec<&IndexEntry> = self
             .tree
             .locate_all_at_point(&point)
             .collect();
 
         if candidates.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        // Sort by paint order descending — first precise hit wins
+        // Sort by paint order descending — topmost (last-painted) first
         candidates.sort_unstable_by(|a, b| b.paint_order.cmp(&a.paint_order));
 
-        for entry in candidates {
-            let node = doc.get(entry.node_id);
-            if let SvgNodeKind::Shape(shape) = &node.kind {
-                if shape_precise_hit(shape, &entry.world_transform, sx, sy) {
-                    return Some(entry.node_id);
+        candidates
+            .into_iter()
+            .filter_map(|entry| {
+                let node = doc.get(entry.node_id);
+                if let SvgNodeKind::Shape(shape) = &node.kind {
+                    if shape_precise_hit(shape, &entry.world_transform, sx, sy) {
+                        return Some(entry.node_id);
+                    }
                 }
-            }
-        }
-
-        None
+                None
+            })
+            .collect()
     }
 
 }
@@ -555,7 +595,24 @@ fn point_to_segment_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -
     let t = t.clamp(0.0, 1.0);
     let qx = ax + t * dx;
     let qy = ay + t * dy;
-    let dpx = px - qx;
+        let dpx = px - qx;
     let dpy = py - qy;
     (dpx * dpx + dpy * dpy).sqrt()
+}
+
+// ---------------------------------------------------------------------------
+// Subtree leaf collection
+// ---------------------------------------------------------------------------
+
+/// Collect all leaf (shape) node ids that are descendants of `node_id`.
+fn collect_leaf_ids(doc: &SvgDocument, node_id: NodeId, out: &mut Vec<NodeId>) {
+    let node = doc.get(node_id);
+    match &node.kind {
+        SvgNodeKind::Shape(_) => out.push(node_id),
+        _ => {
+            for &child in &node.children {
+                collect_leaf_ids(doc, child, out);
+            }
+        }
+    }
 }

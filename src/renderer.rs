@@ -219,6 +219,9 @@ pub struct RenderContext<'a> {
     /// The visible screen rect — used for viewport culling.
     pub viewport: Rect,
     pub highlight: Option<NodeId>,
+    /// Group bbox highlight — drawn as a semi-transparent rect over the viewer.
+    /// `[min_x, min_y, max_x, max_y]` in SVG world space.
+    pub group_highlight_bbox: Option<[f32; 4]>,
     pub textures: &'a HashMap<NodeId, TextureHandle>,
     pub cache: &'a GeometryCache,
 }
@@ -233,6 +236,19 @@ pub fn render(ctx: &RenderContext) {
     // Draw highlighted element last — on top of everything
     if let Some(h) = ctx.highlight {
         render_highlight(ctx, h);
+    }
+
+    // Draw group bbox highlight (from elements pane hover/click on a <g>)
+    if let Some([min_x, min_y, max_x, max_y]) = ctx.group_highlight_bbox {
+        // Transform the two corners through the identity world (bbox is already world-space)
+        let id = Transform::identity();
+        let tl = ctx.vt.world_to_screen(&id, min_x, min_y);
+        let br = ctx.vt.world_to_screen(&id, max_x, max_y);
+        let rect = Rect::from_two_pos(tl, br);
+        let fill = Color32::from_rgba_unmultiplied(30, 140, 255, 35);
+        let stroke_color = Color32::from_rgba_unmultiplied(30, 140, 255, 200);
+        ctx.painter.rect(rect, egui::CornerRadius::ZERO, fill,
+            Stroke::new(1.5, stroke_color), StrokeKind::Outside);
     }
 }
 
@@ -455,17 +471,63 @@ fn render_shape(ctx: &RenderContext, node: &SvgNode, shape: &SvgShape, world: &T
 }
 
 // ---------------------------------------------------------------------------
-// Highlight — re-render the element in solid vivid colour on top
+// Highlight — re-render the element in a smart contrasting colour
 // ---------------------------------------------------------------------------
 
-const HIGHLIGHT_FILL: Color32 = Color32::from_rgba_premultiplied(255, 80, 0, 160);
-const HIGHLIGHT_STROKE: Color32 = Color32::from_rgba_premultiplied(255, 80, 0, 255);
+/// Candidate highlight colours: magenta and cyan.
+/// We pick whichever has the highest perceptual contrast against the element.
+const MAGENTA_FILL:   Color32 = Color32::from_rgba_premultiplied(220, 0,   220, 150);
+const MAGENTA_STROKE: Color32 = Color32::from_rgba_premultiplied(255, 0,   255, 255);
+const CYAN_FILL:      Color32 = Color32::from_rgba_premultiplied(0,   200, 220, 150);
+const CYAN_STROKE:    Color32 = Color32::from_rgba_premultiplied(0,   240, 255, 255);
 
-pub fn highlight_color() -> Color32 { HIGHLIGHT_STROKE }
+pub fn highlight_color() -> Color32 { MAGENTA_STROKE }
+
+/// Perceptual relative luminance (sRGB, ITU-R BT.709).
+fn luminance(c: Color32) -> f32 {
+    let lin = |v: u8| -> f32 {
+        let s = v as f32 / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// Choose magenta or cyan based on which contrasts more with the element's colours.
+fn pick_highlight(node: &SvgNode) -> (Color32, Color32) {
+    // Collect all opaque-ish colours from fill and stroke
+    let mut samples: Vec<Color32> = Vec::new();
+
+    let push_paint = |paint: &Paint, samples: &mut Vec<Color32>| {
+        if let Paint::Color(c) = paint {
+            if c.a > 20 {
+                samples.push(Color32::from_rgb(c.r, c.g, c.b));
+            }
+        }
+    };
+    push_paint(&node.style.fill, &mut samples);
+    push_paint(&node.style.stroke, &mut samples);
+
+    // Average luminance of the element's colours (or 0.5 if none)
+    let element_lum = if samples.is_empty() {
+        0.5
+    } else {
+        samples.iter().map(|&c| luminance(c)).sum::<f32>() / samples.len() as f32
+    };
+
+    // Magenta luminance ≈ 0.28, cyan luminance ≈ 0.60
+    // Pick whichever is further from the element luminance
+    let mag_contrast = (element_lum - 0.28_f32).abs();
+    let cyn_contrast = (element_lum - 0.60_f32).abs();
+
+    if cyn_contrast > mag_contrast {
+        (CYAN_FILL, CYAN_STROKE)
+    } else {
+        (MAGENTA_FILL, MAGENTA_STROKE)
+    }
+}
 
 fn render_highlight(ctx: &RenderContext, node_id: NodeId) {
     let node = ctx.doc.get(node_id);
-    // Recompute world transform for this node by walking ancestors
     let world = compute_world_transform(ctx.doc, node_id);
 
     let shape = match &node.kind {
@@ -473,52 +535,50 @@ fn render_highlight(ctx: &RenderContext, node_id: NodeId) {
         _ => return,
     };
 
+    let (hl_fill, hl_stroke) = pick_highlight(node);
+
     match shape {
         SvgShape::Rect { x, y, width, height, rx, ry } => {
             let tl = ctx.vt.world_to_screen(&world, *x, *y);
             let br = ctx.vt.world_to_screen(&world, x + width, y + height);
             let rect = Rect::from_two_pos(tl, br);
             let rounding = egui::CornerRadius::same((rx.max(*ry) * ctx.vt.scale) as u8);
-            ctx.painter.rect(rect, rounding, HIGHLIGHT_FILL,
-                Stroke::new(2.0, HIGHLIGHT_STROKE), StrokeKind::Outside);
+            ctx.painter.rect(rect, rounding, hl_fill, Stroke::new(2.0, hl_stroke), StrokeKind::Outside);
         }
         SvgShape::Circle { cx, cy, r } => {
             let center = ctx.vt.world_to_screen(&world, *cx, *cy);
             let radius = r * transform_max_scale(&world) * ctx.vt.scale;
-            ctx.painter.circle(center, radius, HIGHLIGHT_FILL,
-                Stroke::new(2.0, HIGHLIGHT_STROKE));
+            ctx.painter.circle(center, radius, hl_fill, Stroke::new(2.0, hl_stroke));
         }
         SvgShape::Ellipse { .. } | SvgShape::Path { .. }
         | SvgShape::Polygon { .. } | SvgShape::Polyline { .. } => {
             if let Some(geom) = ctx.cache.meshes.get(&node_id) {
                 if let Some(m) = &geom.fill {
-                    m.emit(ctx.painter, &world, ctx.vt, HIGHLIGHT_FILL);
+                    m.emit(ctx.painter, &world, ctx.vt, hl_fill);
                 }
                 if let Some(m) = &geom.stroke {
-                    m.emit(ctx.painter, &world, ctx.vt, HIGHLIGHT_STROKE);
+                    m.emit(ctx.painter, &world, ctx.vt, hl_stroke);
                 }
-                // If there was no fill at all (e.g. stroke-only path), still show something
+                // Stroke-only shapes with no cached fill mesh: draw the stroke in highlight colour
                 if geom.fill.is_none() && geom.stroke.is_none() {
-                    // fall through to line
+                    // nothing tessellated (e.g. empty path) — nothing to draw
                 }
             }
         }
         SvgShape::Line { x1, y1, x2, y2 } => {
             let p1 = ctx.vt.world_to_screen(&world, *x1, *y1);
             let p2 = ctx.vt.world_to_screen(&world, *x2, *y2);
-            ctx.painter.line_segment([p1, p2], Stroke::new(3.0, HIGHLIGHT_STROKE));
+            ctx.painter.line_segment([p1, p2], Stroke::new(3.0, hl_stroke));
         }
         SvgShape::Text { x, y, spans, font_size } => {
-            // Highlight: re-render text in vivid colour
-            render_text_spans(ctx, node, *x, *y, *font_size, spans, &world,
-                Some(HIGHLIGHT_STROKE));
+            render_text_spans(ctx, node, *x, *y, *font_size, spans, &world, Some(hl_stroke));
         }
         SvgShape::Image { x, y, width, height, .. } => {
             let tl = ctx.vt.world_to_screen(&world, *x, *y);
             let br = ctx.vt.world_to_screen(&world, x + width, y + height);
             let rect = Rect::from_two_pos(tl, br);
-            ctx.painter.rect(rect, egui::CornerRadius::ZERO, HIGHLIGHT_FILL,
-                Stroke::new(2.0, HIGHLIGHT_STROKE), StrokeKind::Outside);
+            ctx.painter.rect(rect, egui::CornerRadius::ZERO, hl_fill,
+                Stroke::new(2.0, hl_stroke), StrokeKind::Outside);
         }
         SvgShape::Use { .. } => {}
     }
@@ -580,7 +640,12 @@ fn render_text_spans(
 
         let galley = ctx.painter.layout_no_wrap(span.content.clone(), font_id, color);
         let advance_px = galley.size().x;
-        ctx.painter.galley(pos, galley, color);
+        // SVG `y` is the text baseline, but egui galley pos is the top-left corner.
+        // Approximate ascent as 85% of line height (matches spatial_index hitbox formula)
+        // and offset draw position upward so the baseline lands at `pos.y`.
+        let ascent = galley.size().y * 0.85;
+        let draw_pos = egui::pos2(pos.x, pos.y - ascent);
+        ctx.painter.galley(draw_pos, galley, color);
 
         // Advance cursor in SVG units using the actual rendered width
         let advance_svg = advance_px / ctx.vt.scale;
