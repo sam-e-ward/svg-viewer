@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 
+const MAX_RECENTS: usize = 10;
+const RECENTS_FILE: &str = "svg-viewer/recents.json";
+
 use egui::{CentralPanel, Color32, Context, Key, Rect, Sense, SidePanel, TextureHandle, TopBottomPanel, Vec2};
 use egui::epaint::StrokeKind;
 
@@ -84,6 +87,9 @@ pub struct SvgViewerApp {
     /// egui context used for texture uploads (stored after first frame)
     egui_ctx: Option<Context>,
 
+    // --- Recent files / URLs ---
+    recent_items: Vec<String>,
+
     // --- Remote URL loading ---
     /// Whether the "Open from URL" modal is open
     url_modal_open: bool,
@@ -126,6 +132,7 @@ impl SvgViewerApp {
             clip_index: ClipIndex { clips: std::collections::HashMap::new() },
             textures: HashMap::new(),
             egui_ctx: None,
+            recent_items: load_recents(),
             url_modal_open: false,
             url_input: String::new(),
             url_fetch_rx: None,
@@ -138,11 +145,9 @@ impl SvgViewerApp {
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 let svg_dir = path.parent().map(|p| p.to_path_buf());
-                let label = path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                self.load_from_svg_text(contents, label, svg_dir);
+                // Use the full path as the recent key so it can be reopened
+                let full_label = path.to_string_lossy().into_owned();
+                self.load_from_svg_text(contents, full_label, svg_dir);
                 self.file_path = Some(path);
             }
             Err(e) => {
@@ -179,7 +184,8 @@ impl SvgViewerApp {
                 self.tab_cursor_pos = None;
                 self.elements_pane = ElementsPane::new();
                 // Store the label in file_path as a synthetic path so the title bar works
-                self.file_path = Some(PathBuf::from(label));
+                self.file_path = Some(PathBuf::from(label.clone()));
+                self.push_recent(label);
             }
             Err(e) => {
                 self.error = Some(format!("Parse error: {e}"));
@@ -294,6 +300,96 @@ impl SvgViewerApp {
         self.view_fitted = true; // suppress fit-on-load next frame
     }
 
+    /// Add an item to the top of the recents list and persist it.
+    fn push_recent(&mut self, item: String) {
+        self.recent_items.retain(|r| r != &item);
+        self.recent_items.insert(0, item);
+        self.recent_items.truncate(MAX_RECENTS);
+        save_recents(&self.recent_items);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recent items persistence — plain JSON, no serde dependency
+// ---------------------------------------------------------------------------
+
+fn recents_path() -> Option<PathBuf> {
+    // ~/.config/svg-viewer/recents.json
+    dirs_next().map(|d| d.join(RECENTS_FILE))
+}
+
+/// Returns the platform config directory, or ~/.config as a fallback.
+fn dirs_next() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(p));
+    }
+    // macOS: ~/Library/Application Support  (but ~/.config also works and is simpler)
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config"))
+}
+
+fn load_recents() -> Vec<String> {
+    let path = match recents_path() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    parse_json_string_array(&text)
+}
+
+fn save_recents(items: &[String]) {
+    let path = match recents_path() {
+        Some(p) => p,
+        None => return,
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = format_json_string_array(items);
+    let _ = std::fs::write(&path, json);
+}
+
+/// Minimal JSON string-array serialiser — no serde needed.
+fn format_json_string_array(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{}\"", escaped)
+    }).collect();
+    format!("[\n  {}\n]\n", inner.join(",\n  "))
+}
+
+/// Minimal JSON string-array parser — handles the output of the above.
+fn parse_json_string_array(text: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut chars = text.chars().peekable();
+    // Walk through, collecting quoted strings
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut s = String::new();
+            loop {
+                match chars.next() {
+                    Some('\\') => {
+                        match chars.next() {
+                            Some('"')  => s.push('"'),
+                            Some('\\') => s.push('\\'),
+                            Some('n')  => s.push('\n'),
+                            Some(other) => { s.push('\\'); s.push(other); }
+                            None => break,
+                        }
+                    }
+                    Some('"') => break,
+                    Some(ch) => s.push(ch),
+                    None => break,
+                }
+            }
+            if !s.is_empty() {
+                items.push(s);
+            }
+        }
+    }
+    items
 }
 
 impl eframe::App for SvgViewerApp {
@@ -611,6 +707,73 @@ impl eframe::App for SvgViewerApp {
                         ui.add_space(24.0);
                         if ui.button("Open SVG...").clicked() {
                             self.open_file_dialog();
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Open from URL...").clicked() {
+                            self.url_modal_open = true;
+                            self.url_error = None;
+                        }
+
+                        // Recent items
+                        if !self.recent_items.is_empty() {
+                            ui.add_space(32.0);
+                            ui.label(egui::RichText::new("Recent").weak());
+                            ui.add_space(6.0);
+
+                            let recents = self.recent_items.clone();
+                            let mut open_item: Option<String> = None;
+
+                            for item in &recents {
+                                let is_url = item.starts_with("http://") || item.starts_with("https://");
+                                // Display label: for files show just the filename; for URLs show the full URL
+                                let file_name_buf;
+                                let display = if is_url {
+                                    item.as_str()
+                                } else {
+                                    file_name_buf = PathBuf::from(item);
+                                    file_name_buf
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(item.as_str())
+                                };
+                                // Truncate long strings
+                                let display = if display.len() > 60 {
+                                    format!("…{}", &display[display.len() - 57..])
+                                } else {
+                                    display.to_string()
+                                };
+
+                                let icon = if is_url { "🌐 " } else { "📄 " };
+                                let response = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("{icon}{display}"))
+                                            .monospace()
+                                            .size(12.0)
+                                    )
+                                    .sense(egui::Sense::click())
+                                );
+                                if response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                let response = if !is_url {
+                                    response.on_hover_text(item.as_str())
+                                } else {
+                                    response
+                                };
+                                if response.clicked() {
+                                    open_item = Some(item.clone());
+                                }
+                            }
+
+                            if let Some(item) = open_item {
+                                let is_url = item.starts_with("http://") || item.starts_with("https://");
+                                if is_url {
+                                    self.url_input = item.clone();
+                                    self.start_url_fetch(item, ctx.clone());
+                                } else {
+                                    self.load_file(PathBuf::from(item));
+                                }
+                            }
                         }
                     });
                 });
