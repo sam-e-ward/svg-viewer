@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 
 use egui::{CentralPanel, Color32, Context, Key, Rect, Sense, SidePanel, TextureHandle, TopBottomPanel, Vec2};
 use egui::epaint::StrokeKind;
@@ -82,6 +83,18 @@ pub struct SvgViewerApp {
     textures: HashMap<NodeId, TextureHandle>,
     /// egui context used for texture uploads (stored after first frame)
     egui_ctx: Option<Context>,
+
+    // --- Remote URL loading ---
+    /// Whether the "Open from URL" modal is open
+    url_modal_open: bool,
+    /// Current text in the URL input field
+    url_input: String,
+    /// Receives the result of a background HTTP fetch: Ok(svg_text) or Err(message)
+    url_fetch_rx: Option<Receiver<Result<String, String>>>,
+    /// Displayed while a fetch is in flight
+    url_loading: bool,
+    /// Error from the last failed fetch
+    url_error: Option<String>,
 }
 
 impl SvgViewerApp {
@@ -113,47 +126,87 @@ impl SvgViewerApp {
             clip_index: ClipIndex { clips: std::collections::HashMap::new() },
             textures: HashMap::new(),
             egui_ctx: None,
+            url_modal_open: false,
+            url_input: String::new(),
+            url_fetch_rx: None,
+            url_loading: false,
+            url_error: None,
         }
     }
 
     fn load_file(&mut self, path: PathBuf) {
         match std::fs::read_to_string(&path) {
-            Ok(contents) => match parser::parse_svg(&contents) {
-                Ok(mut doc) => {
-                    // Attempt to resolve external image hrefs relative to the SVG directory
-                    let svg_dir = path.parent().map(|p| p.to_path_buf());
-                    parser::resolve_external_images(&mut doc, svg_dir.as_deref());
-
-                    self.textures.clear();
-                    // Build spatial index, geometry cache, and clip index
-                    let index = SpatialIndex::build(&doc);
-                    let cache = GeometryCache::build(&doc);
-                    let clips = ClipIndex::build(&doc);
-                    log::info!("Spatial index + geometry cache + clip index built for {} nodes", doc.nodes.len());
-                    self.spatial_index = Some(index);
-                    self.geometry_cache = cache;
-                    self.clip_index = clips;
-                    self.doc = Some(doc);
-                    self.file_path = Some(path);
-                    self.error = None;
-                    self.view_fitted = false;
-                    self.highlighted = None;
-                    self.highlight_transient = false;
-                    self.group_highlight_bbox = None;
-                    self.tab_candidates.clear();
-                    self.tab_index = 0;
-                    self.tab_cursor_pos = None;
-                    self.elements_pane = ElementsPane::new();
-                }
-                Err(e) => {
-                    self.error = Some(format!("Parse error: {e}"));
-                    self.doc = None;
-                }
-            },
+            Ok(contents) => {
+                let svg_dir = path.parent().map(|p| p.to_path_buf());
+                let label = path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                self.load_from_svg_text(contents, label, svg_dir);
+                self.file_path = Some(path);
+            }
             Err(e) => {
                 self.error = Some(format!("Read error: {e}"));
             }
         }
+    }
+
+    /// Core loader — parses SVG text, builds all indexes, and resets view state.
+    /// `label` is shown in the title bar.  `svg_dir` is used to resolve relative
+    /// image hrefs (pass `None` for remote URLs).
+    fn load_from_svg_text(&mut self, contents: String, label: String, svg_dir: Option<PathBuf>) {
+        match parser::parse_svg(&contents) {
+            Ok(mut doc) => {
+                parser::resolve_external_images(&mut doc, svg_dir.as_deref());
+
+                self.textures.clear();
+                let index = SpatialIndex::build(&doc);
+                let cache = GeometryCache::build(&doc);
+                let clips = ClipIndex::build(&doc);
+                log::info!("Loaded \"{label}\": {} nodes", doc.nodes.len());
+                self.spatial_index = Some(index);
+                self.geometry_cache = cache;
+                self.clip_index = clips;
+                self.doc = Some(doc);
+                self.file_path = None; // cleared; caller sets it for local files
+                self.error = None;
+                self.view_fitted = false;
+                self.highlighted = None;
+                self.highlight_transient = false;
+                self.group_highlight_bbox = None;
+                self.tab_candidates.clear();
+                self.tab_index = 0;
+                self.tab_cursor_pos = None;
+                self.elements_pane = ElementsPane::new();
+                // Store the label in file_path as a synthetic path so the title bar works
+                self.file_path = Some(PathBuf::from(label));
+            }
+            Err(e) => {
+                self.error = Some(format!("Parse error: {e}"));
+                self.doc = None;
+            }
+        }
+    }
+
+    /// Start a background HTTP fetch for the given URL.
+    fn start_url_fetch(&mut self, url: String, egui_ctx: Context) {
+        let (tx, rx) = mpsc::channel();
+        self.url_fetch_rx = Some(rx);
+        self.url_loading = true;
+        self.url_error = None;
+
+        std::thread::spawn(move || {
+            let result = ureq::get(&url)
+                .set("User-Agent", "svg-viewer/1.0")
+                .call()
+                .map_err(|e| format!("Request failed: {e}"))
+                .and_then(|resp| {
+                    resp.into_string()
+                        .map_err(|e| format!("Failed to read response: {e}"))
+                });
+            let _ = tx.send(result);
+            egui_ctx.request_repaint();
+        });
     }
 
     /// Upload any decoded image pixels to egui textures.
@@ -245,6 +298,73 @@ impl SvgViewerApp {
 
 impl eframe::App for SvgViewerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // -- Poll background URL fetch --
+        if let Some(rx) = &self.url_fetch_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.url_fetch_rx = None;
+                self.url_loading = false;
+                match result {
+                    Ok(svg_text) => {
+                        let label = self.url_input.clone();
+                        self.load_from_svg_text(svg_text, label, None);
+                        self.url_modal_open = false;
+                    }
+                    Err(e) => {
+                        self.url_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        // -- URL modal --
+        if self.url_modal_open {
+            egui::Window::new("Open from URL")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .fixed_size([480.0, 140.0])
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.label("Enter the URL of an SVG file:");
+                    ui.add_space(4.0);
+
+                    let submitted = ui.add_sized(
+                        [ui.available_width(), 24.0],
+                        egui::TextEdit::singleline(&mut self.url_input)
+                            .hint_text("https://example.com/file.svg")
+                            .desired_width(f32::INFINITY),
+                    ).lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+
+                    ui.add_space(6.0);
+
+                    if let Some(err) = &self.url_error {
+                        ui.colored_label(egui::Color32::RED, err);
+                        ui.add_space(4.0);
+                    }
+
+                    ui.horizontal(|ui| {
+                        let fetch_clicked = ui.add_enabled(
+                            !self.url_loading && !self.url_input.trim().is_empty(),
+                            egui::Button::new(if self.url_loading { "Loading..." } else { "Open" }),
+                        ).clicked();
+
+                        if (fetch_clicked || submitted) && !self.url_loading {
+                            let url = self.url_input.trim().to_string();
+                            if !url.is_empty() {
+                                self.start_url_fetch(url, ctx.clone());
+                            }
+                        }
+
+                        if ui.button("Cancel").clicked() {
+                            self.url_modal_open = false;
+                            self.url_loading = false;
+                            self.url_fetch_rx = None;
+                            self.url_error = None;
+                        }
+                    });
+                });
+        }
+
         // -- Top menu bar --
         TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -252,6 +372,11 @@ impl eframe::App for SvgViewerApp {
                     if ui.button("Open SVG...").clicked() {
                         ui.close_menu();
                         self.open_file_dialog();
+                    }
+                    if ui.button("Open from URL...").clicked() {
+                        ui.close_menu();
+                        self.url_modal_open = true;
+                        self.url_error = None;
                     }
                     if self.doc.is_some() {
                         if ui.button("Fit to window").clicked() {
