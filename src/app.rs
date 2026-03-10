@@ -90,17 +90,19 @@ pub struct SvgViewerApp {
     // --- Recent files / URLs ---
     recent_items: Vec<String>,
 
-    // --- Remote URL loading ---
+    // --- Loading (file or URL, always on background thread) ---
     /// Whether the "Open from URL" modal is open
     url_modal_open: bool,
     /// Current text in the URL input field
     url_input: String,
-    /// Receives the result of a background HTTP fetch: Ok(svg_text) or Err(message)
-    url_fetch_rx: Option<Receiver<Result<String, String>>>,
-    /// Displayed while a fetch is in flight
-    url_loading: bool,
-    /// Error from the last failed fetch
-    url_error: Option<String>,
+    /// Receives the result of a background load: Ok((svg_text, label, svg_dir)) or Err(msg)
+    load_rx: Option<Receiver<Result<(String, String, Option<PathBuf>), String>>>,
+    /// True while a background load is in flight — shows the loading overlay
+    is_loading: bool,
+    /// Human-readable description of what's being loaded (shown on loading screen)
+    loading_label: String,
+    /// Error from the last failed load
+    load_error: Option<String>,
 }
 
 impl SvgViewerApp {
@@ -135,30 +137,57 @@ impl SvgViewerApp {
             recent_items: load_recents(),
             url_modal_open: false,
             url_input: String::new(),
-            url_fetch_rx: None,
-            url_loading: false,
-            url_error: None,
+            load_rx: None,
+            is_loading: false,
+            loading_label: String::new(),
+            load_error: None,
         }
     }
 
-    fn load_file(&mut self, path: PathBuf) {
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let svg_dir = path.parent().map(|p| p.to_path_buf());
-                // Use the full path as the recent key so it can be reopened
-                let full_label = path.to_string_lossy().into_owned();
-                self.load_from_svg_text(contents, full_label, svg_dir);
-                self.file_path = Some(path);
-            }
-            Err(e) => {
-                self.error = Some(format!("Read error: {e}"));
-            }
-        }
+    /// Kick off a background file read + parse.  Shows the loading overlay immediately.
+    fn load_file(&mut self, path: PathBuf, egui_ctx: Context) {
+        let label = path.to_string_lossy().into_owned();
+        let short = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.start_load(format!("Opening {short}…"), egui_ctx, move || {
+            let svg_dir = path.parent().map(|p| p.to_path_buf());
+            std::fs::read_to_string(&path)
+                .map(|text| (text, label, svg_dir))
+                .map_err(|e| format!("Read error: {e}"))
+        });
     }
 
-    /// Core loader — parses SVG text, builds all indexes, and resets view state.
-    /// `label` is shown in the title bar.  `svg_dir` is used to resolve relative
-    /// image hrefs (pass `None` for remote URLs).
+    /// Kick off a background HTTP fetch.  Shows the loading overlay immediately.
+    fn start_url_fetch(&mut self, url: String, egui_ctx: Context) {
+        let label = url.clone();
+        self.url_modal_open = false;
+        self.start_load(format!("Downloading…"), egui_ctx, move || {
+            ureq::get(&url)
+                .set("User-Agent", "svg-viewer/1.0")
+                .call()
+                .map_err(|e| format!("Request failed: {e}"))
+                .and_then(|resp| resp.into_string().map_err(|e| format!("Read error: {e}")))
+                .map(|text| (text, label, None))
+        });
+    }
+
+    /// Generic background loader.  `work` runs on a thread, returns (text, label, svg_dir).
+    fn start_load<F>(&mut self, description: String, egui_ctx: Context, work: F)
+    where
+        F: FnOnce() -> Result<(String, String, Option<PathBuf>), String> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        self.load_rx = Some(rx);
+        self.is_loading = true;
+        self.loading_label = description;
+        self.load_error = None;
+
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+            egui_ctx.request_repaint();
+        });
+    }
+
+    /// Core loader — parses SVG text, builds all indexes, resets view state.
     fn load_from_svg_text(&mut self, contents: String, label: String, svg_dir: Option<PathBuf>) {
         match parser::parse_svg(&contents) {
             Ok(mut doc) => {
@@ -173,7 +202,6 @@ impl SvgViewerApp {
                 self.geometry_cache = cache;
                 self.clip_index = clips;
                 self.doc = Some(doc);
-                self.file_path = None; // cleared; caller sets it for local files
                 self.error = None;
                 self.view_fitted = false;
                 self.highlighted = None;
@@ -183,7 +211,6 @@ impl SvgViewerApp {
                 self.tab_index = 0;
                 self.tab_cursor_pos = None;
                 self.elements_pane = ElementsPane::new();
-                // Store the label in file_path as a synthetic path so the title bar works
                 self.file_path = Some(PathBuf::from(label.clone()));
                 self.push_recent(label);
             }
@@ -192,27 +219,6 @@ impl SvgViewerApp {
                 self.doc = None;
             }
         }
-    }
-
-    /// Start a background HTTP fetch for the given URL.
-    fn start_url_fetch(&mut self, url: String, egui_ctx: Context) {
-        let (tx, rx) = mpsc::channel();
-        self.url_fetch_rx = Some(rx);
-        self.url_loading = true;
-        self.url_error = None;
-
-        std::thread::spawn(move || {
-            let result = ureq::get(&url)
-                .set("User-Agent", "svg-viewer/1.0")
-                .call()
-                .map_err(|e| format!("Request failed: {e}"))
-                .and_then(|resp| {
-                    resp.into_string()
-                        .map_err(|e| format!("Failed to read response: {e}"))
-                });
-            let _ = tx.send(result);
-            egui_ctx.request_repaint();
-        });
     }
 
     /// Upload any decoded image pixels to egui textures.
@@ -252,14 +258,14 @@ impl SvgViewerApp {
         }
     }
 
-    fn open_file_dialog(&mut self) {
+    fn open_file_dialog(&mut self, egui_ctx: Context) {
         // rfd is synchronous on macOS, runs its own event loop
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("SVG files", &["svg"])
             .add_filter("All files", &["*"])
             .pick_file()
         {
-            self.load_file(path);
+            self.load_file(path, egui_ctx);
         }
     }
 
@@ -394,19 +400,17 @@ fn parse_json_string_array(text: &str) -> Vec<String> {
 
 impl eframe::App for SvgViewerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // -- Poll background URL fetch --
-        if let Some(rx) = &self.url_fetch_rx {
+        // -- Poll background load (file or URL) --
+        if let Some(rx) = &self.load_rx {
             if let Ok(result) = rx.try_recv() {
-                self.url_fetch_rx = None;
-                self.url_loading = false;
+                self.load_rx = None;
+                self.is_loading = false;
                 match result {
-                    Ok(svg_text) => {
-                        let label = self.url_input.clone();
-                        self.load_from_svg_text(svg_text, label, None);
-                        self.url_modal_open = false;
+                    Ok((svg_text, label, svg_dir)) => {
+                        self.load_from_svg_text(svg_text, label, svg_dir);
                     }
                     Err(e) => {
-                        self.url_error = Some(e);
+                        self.load_error = Some(e);
                     }
                 }
             }
@@ -433,18 +437,18 @@ impl eframe::App for SvgViewerApp {
 
                     ui.add_space(6.0);
 
-                    if let Some(err) = &self.url_error {
+                    if let Some(err) = &self.load_error.clone() {
                         ui.colored_label(egui::Color32::RED, err);
                         ui.add_space(4.0);
                     }
 
                     ui.horizontal(|ui| {
-                        let fetch_clicked = ui.add_enabled(
-                            !self.url_loading && !self.url_input.trim().is_empty(),
-                            egui::Button::new(if self.url_loading { "Loading..." } else { "Open" }),
+                        let open_clicked = ui.add_enabled(
+                            !self.url_input.trim().is_empty(),
+                            egui::Button::new("Open"),
                         ).clicked();
 
-                        if (fetch_clicked || submitted) && !self.url_loading {
+                        if open_clicked || submitted {
                             let url = self.url_input.trim().to_string();
                             if !url.is_empty() {
                                 self.start_url_fetch(url, ctx.clone());
@@ -453,62 +457,79 @@ impl eframe::App for SvgViewerApp {
 
                         if ui.button("Cancel").clicked() {
                             self.url_modal_open = false;
-                            self.url_loading = false;
-                            self.url_fetch_rx = None;
-                            self.url_error = None;
+                            self.load_error = None;
                         }
                     });
                 });
         }
 
-        // -- Top menu bar --
+        // -- Top toolbar --
         TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open SVG...").clicked() {
-                        ui.close_menu();
-                        self.open_file_dialog();
-                    }
-                    if ui.button("Open from URL...").clicked() {
-                        ui.close_menu();
-                        self.url_modal_open = true;
-                        self.url_error = None;
-                    }
-                    if self.doc.is_some() {
-                        if ui.button("Fit to window").clicked() {
-                            ui.close_menu();
-                            self.view_fitted = false; // will refit next frame
-                        }
-                    }
-                });
+            ui.horizontal_centered(|ui| {
+                ui.add_space(4.0);
 
-                ui.separator();
-
-                // Status info
-                if let Some(path) = &self.file_path {
-                    ui.label(
-                        egui::RichText::new(
-                            path.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .as_ref(),
-                        )
-                        .weak(),
-                    );
-                    if let Some(doc) = &self.doc {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "  {}×{}  |  {} elements",
-                                doc.width as u32,
-                                doc.height as u32,
-                                doc.nodes.len()
-                            ))
-                            .weak(),
-                        );
+                // Open buttons
+                if ui.button("Open…").clicked() {
+                    self.open_file_dialog(ctx.clone());
+                }
+                if ui.button("Open URL…").clicked() {
+                    self.url_modal_open = true;
+                    self.load_error = None;
+                }
+                if self.doc.is_some() {
+                    if ui.button("Fit").clicked() {
+                        self.view_fitted = false;
                     }
                 }
 
+                ui.separator();
+
+                // File / URL label + stats
+                if let Some(path) = &self.file_path.clone() {
+                    let name = path.file_name()
+                        .unwrap_or_else(|| path.as_os_str())
+                        .to_string_lossy();
+                    ui.label(egui::RichText::new(name.as_ref()).strong());
+
+                    if let Some(doc) = &self.doc {
+                        let w = doc.width as u32;
+                        let h = doc.height as u32;
+                        let n = doc.nodes.len();
+
+                        ui.separator();
+                        ui.label(egui::RichText::new(format!("{w} × {h}")).monospace());
+                        ui.separator();
+
+                        // Element count with hover breakdown
+                        let count_label = ui.label(
+                            egui::RichText::new(format!("{n} elements")).monospace()
+                        );
+                        if count_label.hovered() {
+                            // Build sorted tag frequency table
+                            let mut counts: std::collections::HashMap<&str, usize> =
+                                std::collections::HashMap::new();
+                            for node in &doc.nodes {
+                                *counts.entry(node.tag_name.as_str()).or_insert(0) += 1;
+                            }
+                            let mut sorted: Vec<(&str, usize)> = counts.into_iter().collect();
+                            sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+                            egui::show_tooltip_at_pointer(ctx, ui.layer_id(), egui::Id::new("elem_breakdown"), |ui| {
+                                ui.set_min_width(160.0);
+                                for (tag, count) in &sorted {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(format!("{count}")).monospace().strong());
+                                        ui.label(egui::RichText::new(format!("<{tag}>")).monospace().weak());
+                                    });
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Right-aligned inspect mode indicator
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(4.0);
                     if self.spacebar_held {
                         ui.label(
                             egui::RichText::new("INSPECT MODE")
@@ -531,12 +552,20 @@ impl eframe::App for SvgViewerApp {
         ctx.input(|i| {
             self.spacebar_held = i.key_down(Key::Space);
         });
-        // When spacebar is held, consume Tab before egui can use it for focus traversal.
-        // Capture whether it was pressed this frame, then consume it unconditionally.
-        let tab_pressed_this_frame = self.spacebar_held && ctx.input(|i| i.key_pressed(Key::Tab));
+
+        // While spacebar is held, consume Space so egui can't fire focused buttons with it,
+        // and clear widget focus so nothing can be accidentally activated.
+        let cycle_pressed_this_frame = self.spacebar_held && ctx.input(|i| i.key_pressed(Key::W));
         if self.spacebar_held {
-            ctx.input_mut(|i| { i.consume_key(egui::Modifiers::NONE, Key::Tab); });
+            ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, Key::Space);
+            });
+            // Drop widget focus so Space can't activate menus or buttons
+            if let Some(id) = ctx.memory(|m| m.focused()) {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
         }
+
         // When spacebar is released, clear any transient hover-highlight
         if prev_spacebar && !self.spacebar_held && self.highlight_transient {
             self.highlighted = None;
@@ -572,13 +601,13 @@ impl eframe::App for SvgViewerApp {
         }
 
         // -- Drop file support --
-        ctx.input(|i| {
-            if let Some(dropped) = i.raw.dropped_files.first() {
-                if let Some(path) = &dropped.path {
-                    self.load_file(path.clone());
-                }
-            }
+        let dropped_path = ctx.input(|i| {
+            i.raw.dropped_files.first()
+                .and_then(|f| f.path.clone())
         });
+        if let Some(path) = dropped_path {
+            self.load_file(path, ctx.clone());
+        }
 
         // -- Right: elements pane --
         let elements_response = SidePanel::right("elements_panel")
@@ -686,9 +715,43 @@ impl eframe::App for SvgViewerApp {
                 self.fit_view(viewport);
             }
 
-            if let Some(error) = &self.error {
+            // -- Loading overlay (file read / URL fetch in progress) --
+            if self.is_loading {
                 ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new(error).color(Color32::RED));
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.add(egui::Spinner::new().size(40.0));
+                        ui.add_space(16.0);
+                        ui.label(egui::RichText::new(&self.loading_label).size(16.0));
+                    });
+                });
+                // Keep repainting while loading so the spinner animates
+                ctx.request_repaint();
+                return;
+            }
+
+            if let Some(error) = &self.error.clone() {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(error).color(Color32::RED));
+                        ui.add_space(8.0);
+                        if ui.button("Dismiss").clicked() {
+                            self.error = None;
+                        }
+                    });
+                });
+                return;
+            }
+
+            if let Some(err) = &self.load_error.clone() {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new(err).color(Color32::RED));
+                        ui.add_space(8.0);
+                        if ui.button("Dismiss").clicked() {
+                            self.load_error = None;
+                        }
+                    });
                 });
                 return;
             }
@@ -703,15 +766,15 @@ impl eframe::App for SvgViewerApp {
                                 .weak(),
                         );
                         ui.add_space(16.0);
-                        ui.label(egui::RichText::new("Drop an SVG file here, or use File → Open").weak());
+                        ui.label(egui::RichText::new("Drop an SVG file here, or use the toolbar buttons above").weak());
                         ui.add_space(24.0);
                         if ui.button("Open SVG...").clicked() {
-                            self.open_file_dialog();
+                            self.open_file_dialog(ctx.clone());
                         }
                         ui.add_space(8.0);
                         if ui.button("Open from URL...").clicked() {
                             self.url_modal_open = true;
-                            self.url_error = None;
+                            self.load_error = None;
                         }
 
                         // Recent items
@@ -771,7 +834,7 @@ impl eframe::App for SvgViewerApp {
                                     self.url_input = item.clone();
                                     self.start_url_fetch(item, ctx.clone());
                                 } else {
-                                    self.load_file(PathBuf::from(item));
+                                    self.load_file(PathBuf::from(item), ctx.clone());
                                 }
                             }
                         }
@@ -812,7 +875,7 @@ impl eframe::App for SvgViewerApp {
 
             // -- Spacebar hover → hit-test (FR-5) + TAB cycling (only when Viewer is active) --
             if self.spacebar_held && self.active_pane == ActivePane::Viewer && response.hovered() {
-                let tab_pressed = tab_pressed_this_frame;
+                let tab_pressed = cycle_pressed_this_frame;
 
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     if let Some(doc) = &self.doc {
