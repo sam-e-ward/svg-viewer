@@ -138,20 +138,110 @@ fn points_aabb(tf: &Transform, points: &[(f32, f32)]) -> Option<[f32; 4]> {
 }
 
 fn path_aabb(tf: &Transform, data: &str) -> Option<[f32; 4]> {
+    use crate::spatial_index::CmdKind;
     let cmds = parse_path_to_commands(data);
     if cmds.is_empty() { return None; }
+
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
+    let mut current = (0.0f32, 0.0f32);
+
+    let mut expand = |px: f32, py: f32| {
+        let (tx, ty) = tf.apply(px, py);
+        if tx < min_x { min_x = tx; }
+        if tx > max_x { max_x = tx; }
+        if ty < min_y { min_y = ty; }
+        if ty > max_y { max_y = ty; }
+    };
+
     for cmd in &cmds {
-        for &(px, py) in &cmd.points {
-            let (tx, ty) = tf.apply(px, py);
-            min_x = min_x.min(tx); min_y = min_y.min(ty);
-            max_x = max_x.max(tx); max_y = max_y.max(ty);
+        match cmd.kind {
+            CmdKind::Move | CmdKind::Line => {
+                for &(px, py) in &cmd.points {
+                    expand(px, py);
+                    current = (px, py);
+                }
+            }
+            CmdKind::Cubic => {
+                if cmd.points.len() >= 3 {
+                    let (p0, p1, p2, p3) = (current, cmd.points[0], cmd.points[1], cmd.points[2]);
+                    cubic_bbox_expand(p0, p1, p2, p3, &mut expand);
+                    current = p3;
+                }
+            }
+            CmdKind::Quadratic => {
+                if cmd.points.len() >= 2 {
+                    let (p0, p1, p2) = (current, cmd.points[0], cmd.points[1]);
+                    quadratic_bbox_expand(p0, p1, p2, &mut expand);
+                    current = p2;
+                }
+            }
+            CmdKind::Close => {}
         }
     }
+
     if min_x == f32::INFINITY { None } else { Some([min_x, min_y, max_x, max_y]) }
+}
+
+fn cubic_bbox_expand<F: FnMut(f32, f32)>(
+    p0: (f32,f32), p1: (f32,f32), p2: (f32,f32), p3: (f32,f32),
+    expand: &mut F,
+) {
+    expand(p0.0, p0.1);
+    expand(p3.0, p3.1);
+    let mut ts = [f32::NAN; 4];
+    let mut nt = 0usize;
+    for axis in 0..2usize {
+        let v = |p: (f32,f32)| if axis == 0 { p.0 } else { p.1 };
+        let (a0,a1,a2,a3) = (v(p0),v(p1),v(p2),v(p3));
+        let aa = -a0 + 3.0*a1 - 3.0*a2 + a3;
+        let bb = 2.0*(a0 - 2.0*a1 + a2);
+        let cc = a1 - a0;
+        for t in solve_quadratic(aa, bb, cc) {
+            if !t.is_nan() && t > 0.0 && t < 1.0 { ts[nt] = t; nt += 1; }
+        }
+    }
+    for &t in &ts[..nt] {
+        let u = 1.0 - t;
+        let x = u*u*u*p0.0 + 3.0*u*u*t*p1.0 + 3.0*u*t*t*p2.0 + t*t*t*p3.0;
+        let y = u*u*u*p0.1 + 3.0*u*u*t*p1.1 + 3.0*u*t*t*p2.1 + t*t*t*p3.1;
+        expand(x, y);
+    }
+}
+
+fn quadratic_bbox_expand<F: FnMut(f32, f32)>(
+    p0: (f32,f32), p1: (f32,f32), p2: (f32,f32),
+    expand: &mut F,
+) {
+    expand(p0.0, p0.1);
+    expand(p2.0, p2.1);
+    for axis in 0..2usize {
+        let v = |p: (f32,f32)| if axis == 0 { p.0 } else { p.1 };
+        let (a0,a1,a2) = (v(p0),v(p1),v(p2));
+        let denom = a0 - 2.0*a1 + a2;
+        if denom.abs() > 1e-10 {
+            let t = (a0 - a1) / denom;
+            if t > 0.0 && t < 1.0 {
+                let u = 1.0 - t;
+                let x = u*u*p0.0 + 2.0*u*t*p1.0 + t*t*p2.0;
+                let y = u*u*p0.1 + 2.0*u*t*p1.1 + t*t*p2.1;
+                expand(x, y);
+            }
+        }
+    }
+}
+
+fn solve_quadratic(a: f32, b: f32, c: f32) -> [f32; 2] {
+    if a.abs() < 1e-10 {
+        if b.abs() < 1e-10 { return [f32::NAN, f32::NAN]; }
+        return [-c / b, f32::NAN];
+    }
+    let disc = b*b - 4.0*a*c;
+    if disc < 0.0 { return [f32::NAN, f32::NAN]; }
+    let sq = disc.sqrt();
+    [(-b - sq) / (2.0*a), (-b + sq) / (2.0*a)]
 }
 
 fn union(existing: Option<[f32; 4]>, bb: [f32; 4]) -> [f32; 4] {

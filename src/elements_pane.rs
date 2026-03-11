@@ -3,7 +3,7 @@
 use egui::{Color32, Ui};
 use std::collections::HashSet;
 
-use crate::svg_doc::{NodeId, SvgDocument, SvgNodeKind};
+use crate::svg_doc::{NodeId, SvgDocument};
 
 pub struct ElementsPane {
     /// Set of node ids that are currently collapsed (children hidden)
@@ -29,9 +29,25 @@ impl ElementsPane {
         let mut clicked = None;
         let mut hovered = None;
 
-        egui::ScrollArea::vertical()
+        // Intercept Shift+scroll to drive horizontal scrolling.
+        // We do this by converting vertical scroll delta → horizontal when shift is held,
+        // before the ScrollArea consumes it.
+        let pointer_over = ui.rect_contains_pointer(ui.available_rect_before_wrap());
+        if pointer_over && ui.input(|i| i.modifiers.shift) {
+            let v_delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if v_delta != 0.0 {
+                // Consume the vertical delta and re-emit it as horizontal
+                ui.input_mut(|i| {
+                    i.smooth_scroll_delta.x -= i.smooth_scroll_delta.y;
+                    i.smooth_scroll_delta.y = 0.0;
+                });
+            }
+        }
+
+        egui::ScrollArea::both()
             .id_salt("elements_scroll")
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .show(ui, |ui| {
                 ui.style_mut().spacing.item_spacing.y = 1.0;
                 self.show_node(ui, doc, doc.root, 0, &mut clicked, &mut hovered);
@@ -53,70 +69,43 @@ impl ElementsPane {
         let is_leaf = node.children.is_empty();
         let is_collapsed = self.collapsed.contains(&node_id);
         let is_selected = self.selected == Some(node_id);
-        let is_container = matches!(
-            node.kind,
-            SvgNodeKind::Svg { .. }
-                | SvgNodeKind::Group
-                | SvgNodeKind::Defs
-                | SvgNodeKind::ClipPath { .. }
-                | SvgNodeKind::Mask { .. }
-        );
 
         let indent = depth as f32 * 14.0;
-
-        // Build label
         let tag_color = tag_color(&node.tag_name);
         let label = build_label(&node.tag_name, &node.attr_summary);
 
-        // Row
-        let row_height = 20.0;
-        let (rect, response) = ui.allocate_exact_size(
-            egui::Vec2::new(ui.available_width(), row_height),
-            egui::Sense::click(),
-        );
+        // --- Row ---
+        // We use a horizontal layout so the label widget can be selectable.
+        // The row background and collapse-triangle are painted manually; the text
+        // is an egui Label so the user can select/copy it.
 
-        // Scroll to selected
-        let needs_scroll = self.scroll_to == Some(node_id);
-        if needs_scroll {
-            ui.scroll_to_rect(rect, Some(egui::Align::Center));
-            self.scroll_to = None;
-        }
+        let row_response = ui.horizontal(|ui| {
+            // Indent spacer
+            ui.add_space(indent);
 
-        if ui.is_rect_visible(rect) {
-            let bg = if is_selected {
-                Color32::from_rgba_unmultiplied(30, 120, 255, 60)
-            } else if response.hovered() {
-                Color32::from_rgba_unmultiplied(100, 100, 100, 30)
-            } else {
-                Color32::TRANSPARENT
-            };
+            // Collapse triangle — a small clickable region
+            let triangle_size = egui::Vec2::new(14.0, 20.0);
+            let (tri_rect, tri_response) = ui.allocate_exact_size(triangle_size, egui::Sense::click());
 
-            ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, bg);
-
-            // Collapse triangle
-            let triangle_x = rect.left() + indent + 4.0;
-            let triangle_center = egui::Pos2::new(triangle_x, rect.center().y);
-
-            if !is_leaf {
+            if ui.is_rect_visible(tri_rect) && !is_leaf {
                 let triangle_color = Color32::from_gray(160);
+                let c = tri_rect.center();
                 if is_collapsed {
-                    // Right-pointing triangle ▶
                     ui.painter().add(egui::Shape::convex_polygon(
                         vec![
-                            triangle_center + egui::Vec2::new(-4.0, -5.0),
-                            triangle_center + egui::Vec2::new(6.0, 0.0),
-                            triangle_center + egui::Vec2::new(-4.0, 5.0),
+                            c + egui::Vec2::new(-3.0, -5.0),
+                            c + egui::Vec2::new(5.0, 0.0),
+                            c + egui::Vec2::new(-3.0, 5.0),
                         ],
                         triangle_color,
                         egui::Stroke::NONE,
                     ));
                 } else {
-                    // Down-pointing triangle ▼
                     ui.painter().add(egui::Shape::convex_polygon(
                         vec![
-                            triangle_center + egui::Vec2::new(-5.0, -3.0),
-                            triangle_center + egui::Vec2::new(5.0, -3.0),
-                            triangle_center + egui::Vec2::new(0.0, 5.0),
+                            c + egui::Vec2::new(-5.0, -3.0),
+                            c + egui::Vec2::new(5.0, -3.0),
+                            c + egui::Vec2::new(0.0, 5.0),
                         ],
                         triangle_color,
                         egui::Stroke::NONE,
@@ -124,23 +113,52 @@ impl ElementsPane {
                 }
             }
 
-            // Tag text
-            let text_x = triangle_x + 14.0;
-            let text_pos = egui::Pos2::new(text_x, rect.center().y);
-            ui.painter().text(
-                text_pos,
-                egui::Align2::LEFT_CENTER,
-                &label,
-                egui::FontId::monospace(12.0),
-                tag_color,
+            // Selectable label — wrapping disabled so the full text stays on one line
+            let rich = egui::RichText::new(&label)
+                .monospace()
+                .size(12.0)
+                .color(tag_color);
+            let label_response = ui.add(
+                egui::Label::new(rich)
+                    .selectable(true)
+                    .extend()   // single line, no wrap, no truncate
             );
+
+            (tri_response, label_response)
+        });
+
+        let (tri_response, label_response) = row_response.inner;
+        let row_rect = row_response.response.rect;
+
+        // Scroll to selected
+        if self.scroll_to == Some(node_id) {
+            ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+            self.scroll_to = None;
         }
 
-        if response.hovered() {
+        // Row background (drawn behind everything via the painter)
+        let bg = if is_selected {
+            Color32::from_rgba_unmultiplied(30, 120, 255, 60)
+        } else if row_response.response.hovered() || label_response.hovered() {
+            Color32::from_rgba_unmultiplied(100, 100, 100, 30)
+        } else {
+            Color32::TRANSPARENT
+        };
+        if bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(row_rect, egui::CornerRadius::ZERO, bg);
+        }
+
+        // Hover / click handling
+        if row_response.response.hovered() || label_response.hovered() {
             *hovered = Some(node_id);
         }
 
-        if response.clicked() {
+        // Clicking the triangle or the label row selects / collapses
+        let row_clicked = row_response.response.clicked()
+            || tri_response.clicked()
+            || label_response.clicked();
+
+        if row_clicked {
             *clicked = Some(node_id);
             self.selected = Some(node_id);
             if !is_leaf {
@@ -152,12 +170,8 @@ impl ElementsPane {
             }
         }
 
-        // Recurse into children if not collapsed
-        if !is_collapsed && is_container {
-            for &child in &node.children.clone() {
-                self.show_node(ui, doc, child, depth + 1, clicked, hovered);
-            }
-        } else if !is_collapsed && !is_leaf {
+        // Recurse
+        if !is_collapsed {
             for &child in &node.children.clone() {
                 self.show_node(ui, doc, child, depth + 1, clicked, hovered);
             }

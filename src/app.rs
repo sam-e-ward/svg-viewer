@@ -897,7 +897,7 @@ impl eframe::App for SvgViewerApp {
                             self.tab_candidates = self
                                 .spatial_index
                                 .as_ref()
-                                .map(|idx| idx.hit_test_all(doc_ref, sx, sy))
+                                .map(|idx| idx.hit_test_all(doc_ref, sx, sy, self.view.scale))
                                 .unwrap_or_default();
                             self.tab_index = 0;
                             self.tab_cursor_pos = Some((sx, sy));

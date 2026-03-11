@@ -14,7 +14,7 @@
 use rstar::{RTree, RTreeObject, AABB, PointDistance};
 
 use crate::svg_doc::{
-    NodeId, SvgDocument, SvgNodeKind, SvgShape, Transform,
+    NodeId, Paint, SvgDocument, SvgNodeKind, SvgShape, Transform,
 };
 use crate::parser::parse_path_to_commands;
 
@@ -33,6 +33,10 @@ pub struct IndexEntry {
     aabb: AABB<[f32; 2]>,
     /// The full accumulated transform from root → this node
     pub world_transform: Transform,
+    /// Stroke width in local SVG units (0 = no stroke)
+    pub stroke_width: f32,
+    /// Whether the fill is None (affects hit-test strategy)
+    pub fill_none: bool,
 }
 
 impl RTreeObject for IndexEntry {
@@ -112,13 +116,18 @@ impl SpatialIndex {
 
     /// Full precise hit-test: returns the topmost NodeId where the point is
     /// geometrically inside the shape (not just inside the AABB).
-    pub fn hit_test_precise(&self, doc: &SvgDocument, sx: f32, sy: f32) -> Option<NodeId> {
-        self.hit_test_all(doc, sx, sy).into_iter().next()
+    pub fn hit_test_precise(&self, doc: &SvgDocument, sx: f32, sy: f32, view_scale: f32) -> Option<NodeId> {
+        self.hit_test_all(doc, sx, sy, view_scale).into_iter().next()
     }
 
     /// Returns all NodeIds precisely hit at `(sx, sy)`, sorted topmost-first
     /// (descending paint order). Used for TAB-cycling through stacked elements.
-    pub fn hit_test_all(&self, doc: &SvgDocument, sx: f32, sy: f32) -> Vec<NodeId> {
+    ///
+    /// `view_scale` is the current viewport zoom (screen pixels per SVG unit).
+    /// It is used to express the minimum stroke pick radius in screen pixels rather
+    /// than SVG units, so hairline strokes stay pickable without creating enormous
+    /// hit areas when zoomed in.
+    pub fn hit_test_all(&self, doc: &SvgDocument, sx: f32, sy: f32, view_scale: f32) -> Vec<NodeId> {
         let point = [sx, sy];
 
         let mut candidates: Vec<&IndexEntry> = self
@@ -138,7 +147,14 @@ impl SpatialIndex {
             .filter_map(|entry| {
                 let node = doc.get(entry.node_id);
                 if let SvgNodeKind::Shape(shape) = &node.kind {
-                    if shape_precise_hit(shape, &entry.world_transform, sx, sy) {
+                    if shape_precise_hit(
+                        shape,
+                        &entry.world_transform,
+                        sx, sy,
+                        entry.stroke_width,
+                        entry.fill_none,
+                        view_scale,
+                    ) {
                         return Some(entry.node_id);
                     }
                 }
@@ -169,13 +185,20 @@ fn collect_entries(
             }
         }
         SvgNodeKind::Shape(shape) => {
-            if let Some(aabb) = shape_aabb(shape, &world) {
+            let stroke_width = match &node.style.stroke {
+                Paint::None => 0.0,
+                _ => node.style.stroke_width,
+            };
+            let fill_none = matches!(&node.style.fill, Paint::None);
+            if let Some(aabb) = shape_aabb(shape, &world, stroke_width) {
                 let paint_order = entries.len();
                 entries.push(IndexEntry {
                     node_id,
                     paint_order,
                     aabb,
                     world_transform: world,
+                    stroke_width,
+                    fill_none,
                 });
             }
         }
@@ -188,23 +211,27 @@ fn collect_entries(
 // AABB computation
 // ---------------------------------------------------------------------------
 
-fn shape_aabb(shape: &SvgShape, world: &Transform) -> Option<AABB<[f32; 2]>> {
+fn shape_aabb(shape: &SvgShape, world: &Transform, stroke_width: f32) -> Option<AABB<[f32; 2]>> {
+    // Padding applied in world space: half stroke width transformed by scale.
+    // We'll add it after transformation.
+    let half_sw = stroke_width / 2.0;
+    // Minimum 1-unit pad so shapes are always findable
+    let pad = half_sw.max(1.0);
+
     match shape {
         SvgShape::Rect { x, y, width, height, .. } => {
-            // Transform all four corners
             let corners = [
                 (*x, *y),
                 (x + width, *y),
                 (*x, y + height),
                 (x + width, y + height),
             ];
-            Some(corners_aabb(&corners, world))
+            Some(corners_aabb_with_pad(&corners, world, pad))
         }
         SvgShape::Circle { cx, cy, r } => {
-            // Transform centre, use radius scaled by max(|sx|, |sy|)
             let (tcx, tcy) = world.apply(*cx, *cy);
             let scale = transform_max_scale(world);
-            let tr = r * scale;
+            let tr = r * scale + pad * scale;
             Some(AABB::from_corners(
                 [tcx - tr, tcy - tr],
                 [tcx + tr, tcy + tr],
@@ -217,31 +244,31 @@ fn shape_aabb(shape: &SvgShape, world: &Transform) -> Option<AABB<[f32; 2]>> {
                 (cx - rx, cy + ry),
                 (cx + rx, cy + ry),
             ];
-            Some(corners_aabb(&corners, world))
+            Some(corners_aabb_with_pad(&corners, world, pad))
         }
         SvgShape::Line { x1, y1, x2, y2 } => {
             let corners = [(*x1, *y1), (*x2, *y2)];
-            Some(corners_aabb_with_pad(&corners, world, 4.0))
+            // Lines must always have some pickup radius
+            let line_pad = half_sw.max(2.0);
+            Some(corners_aabb_with_pad(&corners, world, line_pad))
         }
         SvgShape::Polyline { points } | SvgShape::Polygon { points } => {
             if points.is_empty() {
                 return None;
             }
-            Some(corners_aabb(points, world))
+            Some(corners_aabb_with_pad(points, world, pad))
         }
         SvgShape::Path { data } => {
-            path_aabb(data, world)
+            path_aabb(data, world, pad)
         }
         SvgShape::Text { x, y, spans, font_size } => {
-            // Use the first span's x/y if it overrides the base position
             let start_x = spans.first().and_then(|s| s.x).unwrap_or(*x);
             let start_y = spans.first().and_then(|s| s.y).unwrap_or(*y);
             let total_chars: usize = spans.iter().map(|s| s.content.len()).sum();
-            // 0.6em per char is an approximation; pad generously for hitbox
-            let w = (total_chars as f32 * font_size * 0.65).max(*font_size);
-            // ascent ~0.8em above baseline, descender ~0.2em below
-            let ascent = font_size * 0.85;
-            let descent = font_size * 0.25;
+            // 0.6em per char; pad generously for hitbox
+            let w = (total_chars as f32 * font_size * 0.6).max(*font_size);
+            let ascent = font_size * 0.8;
+            let descent = font_size * 0.2;
             let corners = [
                 (start_x, start_y - ascent),
                 (start_x + w, start_y - ascent),
@@ -287,10 +314,9 @@ fn corners_aabb_with_pad(corners: &[(f32, f32)], world: &Transform, pad: f32) ->
     )
 }
 
-/// Scan a path `d` string and collect control points to approximate the AABB.
-/// This is not perfectly tight for curves, but is very fast and conservative
-/// (may include some extra area around bezier control hulls).
-fn path_aabb(data: &str, world: &Transform) -> Option<AABB<[f32; 2]>> {
+/// Compute a tight bounding box for a path by analytically finding the extrema
+/// of each cubic/quadratic Bézier segment, rather than just using control points.
+fn path_aabb(data: &str, world: &Transform, pad: f32) -> Option<AABB<[f32; 2]>> {
     let cmds = parse_path_to_commands(data);
     if cmds.is_empty() {
         return None;
@@ -300,23 +326,44 @@ fn path_aabb(data: &str, world: &Transform) -> Option<AABB<[f32; 2]>> {
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
+
+    let mut expand = |x: f32, y: f32| {
+        let (tx, ty) = world.apply(x, y);
+        if tx < min_x { min_x = tx; }
+        if tx > max_x { max_x = tx; }
+        if ty < min_y { min_y = ty; }
+        if ty > max_y { max_y = ty; }
+    };
+
     let mut current = (0.0f32, 0.0f32);
-    let mut start = (0.0f32, 0.0f32);
 
     for cmd in &cmds {
-        for &(x, y) in &cmd.points {
-            // Accumulate in local space first, then transform
-            let (tx, ty) = world.apply(x, y);
-            min_x = min_x.min(tx);
-            min_y = min_y.min(ty);
-            max_x = max_x.max(tx);
-            max_y = max_y.max(ty);
-        }
-        if let Some(&last) = cmd.points.last() {
-            current = last;
-        }
-        if cmd.is_move {
-            start = current;
+        match cmd.kind {
+            CmdKind::Move | CmdKind::Line => {
+                for &(x, y) in &cmd.points {
+                    expand(x, y);
+                    current = (x, y);
+                }
+            }
+            CmdKind::Cubic => {
+                let pts = &cmd.points;
+                if pts.len() >= 3 {
+                    let (p0, p1, p2, p3) = (current, pts[0], pts[1], pts[2]);
+                    cubic_bbox(p0, p1, p2, p3, &mut expand);
+                    current = p3;
+                }
+            }
+            CmdKind::Quadratic => {
+                let pts = &cmd.points;
+                if pts.len() >= 2 {
+                    let (p0, p1, p2) = (current, pts[0], pts[1]);
+                    quadratic_bbox(p0, p1, p2, &mut expand);
+                    current = p2;
+                }
+            }
+            CmdKind::Close => {
+                // No new geometry to bound; close just draws a line back
+            }
         }
     }
 
@@ -324,11 +371,110 @@ fn path_aabb(data: &str, world: &Transform) -> Option<AABB<[f32; 2]>> {
         return None;
     }
 
-    // Small pad for stroke width tolerance
     Some(AABB::from_corners(
-        [min_x - 2.0, min_y - 2.0],
-        [max_x + 2.0, max_y + 2.0],
+        [min_x - pad, min_y - pad],
+        [max_x + pad, max_y + pad],
     ))
+}
+
+/// Expand a bounding box to include all extrema of a cubic Bézier.
+/// Extrema occur at t=0, t=1, and the roots of the derivative (one quadratic per axis).
+fn cubic_bbox<F: FnMut(f32, f32)>(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
+    expand: &mut F,
+) {
+    // Always include endpoints
+    expand(p0.0, p0.1);
+    expand(p3.0, p3.1);
+
+    // Collect interior extremum t-values from both axes
+    let mut ts = [f32::NAN; 4];
+    let mut nt = 0usize;
+
+    for axis in 0..2usize {
+        let v = |p: (f32, f32)| if axis == 0 { p.0 } else { p.1 };
+        let a0 = v(p0); let a1 = v(p1); let a2 = v(p2); let a3 = v(p3);
+        // d/dt cubic = 3[(-a0+3a1-3a2+a3)t^2 + 2(a0-2a1+a2)t + (a1-a0)]
+        let aa = -a0 + 3.0*a1 - 3.0*a2 + a3;
+        let bb = 2.0*(a0 - 2.0*a1 + a2);
+        let cc = a1 - a0;
+        for t in quadratic_roots(aa, bb, cc) {
+            if !t.is_nan() && t > 0.0 && t < 1.0 {
+                ts[nt] = t;
+                nt += 1;
+            }
+        }
+    }
+
+    for &t in &ts[..nt] {
+        let (ex, ey) = cubic_eval2(p0, p1, p2, p3, t);
+        expand(ex, ey);
+    }
+}
+
+/// Evaluate a cubic Bézier at parameter t, returning both x and y.
+fn cubic_eval2(p0: (f32,f32), p1: (f32,f32), p2: (f32,f32), p3: (f32,f32), t: f32) -> (f32,f32) {
+    let u = 1.0 - t;
+    let x = u*u*u*p0.0 + 3.0*u*u*t*p1.0 + 3.0*u*t*t*p2.0 + t*t*t*p3.0;
+    let y = u*u*u*p0.1 + 3.0*u*u*t*p1.1 + 3.0*u*t*t*p2.1 + t*t*t*p3.1;
+    (x, y)
+}
+
+/// Evaluate one axis of a cubic Bézier at t (kept for legacy callers — not used).
+#[allow(dead_code)]
+fn cubic_eval(p0: (f32,f32), p1: (f32,f32), p2: (f32,f32), p3: (f32,f32), t: f32) -> f32 {
+    let u = 1.0 - t;
+    u*u*u*p0.0 + 3.0*u*u*t*p1.0 + 3.0*u*t*t*p2.0 + t*t*t*p3.0
+}
+
+/// Expand a bounding box to include all extrema of a quadratic Bézier.
+fn quadratic_bbox<F: FnMut(f32, f32)>(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    expand: &mut F,
+) {
+    expand(p0.0, p0.1);
+    expand(p2.0, p2.1);
+
+    for axis in 0..2 {
+        let v = |p: (f32, f32)| if axis == 0 { p.0 } else { p.1 };
+        let a0 = v(p0);
+        let a1 = v(p1);
+        let a2 = v(p2);
+        // Derivative of quadratic: 2*(a1-a0) + 2*(a0-2*a1+a2)*t = 0
+        // t = (a0 - a1) / (a0 - 2*a1 + a2)
+        let denom = a0 - 2.0 * a1 + a2;
+        if denom.abs() > 1e-10 {
+            let t = (a0 - a1) / denom;
+            if t > 0.0 && t < 1.0 {
+                let u = 1.0 - t;
+                let px = u*u*p0.0 + 2.0*u*t*p1.0 + t*t*p2.0;
+                let py = u*u*p0.1 + 2.0*u*t*p1.1 + t*t*p2.1;
+                expand(px, py);
+            }
+        }
+    }
+}
+
+/// Solve At^2 + Bt + C = 0, returning real roots in [0,1].
+fn quadratic_roots(a: f32, b: f32, c: f32) -> [f32; 2] {
+    if a.abs() < 1e-10 {
+        // Linear
+        if b.abs() < 1e-10 {
+            return [f32::NAN, f32::NAN];
+        }
+        return [-c / b, f32::NAN];
+    }
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return [f32::NAN, f32::NAN];
+    }
+    let sq = disc.sqrt();
+    [(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
 }
 
 fn transform_max_scale(t: &Transform) -> f32 {
@@ -342,18 +488,56 @@ fn transform_max_scale(t: &Transform) -> f32 {
 // Precise per-shape hit-tests (world-space point, local-space geometry)
 // ---------------------------------------------------------------------------
 
-fn shape_precise_hit(shape: &SvgShape, world: &Transform, wx: f32, wy: f32) -> bool {
+fn shape_precise_hit(
+    shape: &SvgShape,
+    world: &Transform,
+    wx: f32,
+    wy: f32,
+    stroke_width: f32,
+    fill_none: bool,
+    view_scale: f32,
+) -> bool {
     // Transform the test point into local (element) space
     let (lx, ly) = inverse_transform(world, wx, wy);
 
+    // Stroke pick threshold in local SVG units.
+    //
+    // We want the threshold to be:
+    //   max(stroke_width / 2,  MIN_SCREEN_PX / total_scale)
+    //
+    // where total_scale = world_scale * view_scale converts local units → screen px.
+    // MIN_SCREEN_PX = 3 keeps any stroke pickable when it is near the cursor,
+    // but the threshold shrinks as you zoom in so it doesn't become enormous.
+    const MIN_SCREEN_PX: f32 = 3.0;
+    let world_scale = transform_max_scale(world).max(1e-6);
+    let min_local = MIN_SCREEN_PX / (world_scale * view_scale);
+    let stroke_thresh = (stroke_width / 2.0).max(min_local);
+
     match shape {
         SvgShape::Rect { x, y, width, height, .. } => {
-            lx >= *x && lx <= x + width && ly >= *y && ly <= y + height
+            let inside = lx >= *x && lx <= x + width && ly >= *y && ly <= y + height;
+            if fill_none {
+                if !inside {
+                    return false;
+                }
+                let dl = (lx - x).abs();
+                let dr = (lx - (x + width)).abs();
+                let dt = (ly - y).abs();
+                let db = (ly - (y + height)).abs();
+                dl.min(dr).min(dt).min(db) <= stroke_thresh
+            } else {
+                inside
+            }
         }
         SvgShape::Circle { cx, cy, r } => {
             let dx = lx - cx;
             let dy = ly - cy;
-            dx * dx + dy * dy <= r * r
+            let dist = (dx * dx + dy * dy).sqrt();
+            if fill_none {
+                (dist - r).abs() <= stroke_thresh
+            } else {
+                dist <= *r
+            }
         }
         SvgShape::Ellipse { cx, cy, rx, ry } => {
             if *rx == 0.0 || *ry == 0.0 {
@@ -361,33 +545,56 @@ fn shape_precise_hit(shape: &SvgShape, world: &Transform, wx: f32, wy: f32) -> b
             }
             let dx = (lx - cx) / rx;
             let dy = (ly - cy) / ry;
-            dx * dx + dy * dy <= 1.0
+            let norm = dx * dx + dy * dy;
+            if fill_none {
+                let thr_x = stroke_thresh / rx;
+                let thr_y = stroke_thresh / ry;
+                let thr = thr_x.min(thr_y);
+                let inner = (1.0 - thr).max(0.0);
+                let outer = 1.0 + thr;
+                norm >= inner * inner && norm <= outer * outer
+            } else {
+                norm <= 1.0
+            }
         }
         SvgShape::Line { x1, y1, x2, y2 } => {
-            point_to_segment_dist(lx, ly, *x1, *y1, *x2, *y2) < 4.0
+            point_to_segment_dist(lx, ly, *x1, *y1, *x2, *y2) <= stroke_thresh
         }
         SvgShape::Polyline { points } => {
             for w in points.windows(2) {
-                if point_to_segment_dist(lx, ly, w[0].0, w[0].1, w[1].0, w[1].1) < 3.0 {
+                if point_to_segment_dist(lx, ly, w[0].0, w[0].1, w[1].0, w[1].1) <= stroke_thresh {
                     return true;
                 }
             }
             false
         }
         SvgShape::Polygon { points } => {
-            // Ray-cast for filled polygon
-            point_in_polygon(lx, ly, points)
+            if fill_none {
+                for w in points.windows(2) {
+                    if point_to_segment_dist(lx, ly, w[0].0, w[0].1, w[1].0, w[1].1) <= stroke_thresh {
+                        return true;
+                    }
+                }
+                if let (Some(&first), Some(&last)) = (points.first(), points.last()) {
+                    if point_to_segment_dist(lx, ly, last.0, last.1, first.0, first.1) <= stroke_thresh {
+                        return true;
+                    }
+                }
+                false
+            } else {
+                point_in_polygon(lx, ly, points)
+            }
         }
         SvgShape::Path { data } => {
-            path_hit_test(data, lx, ly)
+            path_hit_test(data, lx, ly, fill_none, stroke_thresh)
         }
         SvgShape::Text { x, y, spans, font_size } => {
             let start_x = spans.first().and_then(|s| s.x).unwrap_or(*x);
             let start_y = spans.first().and_then(|s| s.y).unwrap_or(*y);
             let total_chars: usize = spans.iter().map(|s| s.content.len()).sum();
-            let w = (total_chars as f32 * font_size * 0.65).max(*font_size);
-            let ascent = font_size * 0.85;
-            let descent = font_size * 0.25;
+            let w = (total_chars as f32 * font_size * 0.6).max(*font_size);
+            let ascent = font_size * 0.8;
+            let descent = font_size * 0.2;
             lx >= start_x && lx <= start_x + w
                 && ly >= start_y - ascent && ly <= start_y + descent
         }
@@ -402,16 +609,26 @@ fn shape_precise_hit(shape: &SvgShape, world: &Transform, wx: f32, wy: f32) -> b
 // Path hit-test: even-odd ray casting in local space
 // ---------------------------------------------------------------------------
 
-fn path_hit_test(data: &str, lx: f32, ly: f32) -> bool {
+fn path_hit_test(data: &str, lx: f32, ly: f32, fill_none: bool, stroke_thresh: f32) -> bool {
     let cmds = parse_path_to_commands(data);
     if cmds.is_empty() {
         return false;
     }
 
-    // Build a list of line segments from the path commands (approximating curves
-    // with polylines), then do an even-odd ray cast.
     let segments = path_to_segments(&cmds);
-    even_odd_ray_cast(lx, ly, &segments)
+
+    if fill_none {
+        // Stroke-only path: hit if within stroke_thresh of any segment
+        for &((x1, y1), (x2, y2)) in &segments {
+            if point_to_segment_dist(lx, ly, x1, y1, x2, y2) <= stroke_thresh {
+                return true;
+            }
+        }
+        false
+    } else {
+        // Filled path: even-odd interior test; also allow picking near stroke
+        even_odd_ray_cast(lx, ly, &segments)
+    }
 }
 
 /// Flattened segment: (x1,y1) → (x2,y2)

@@ -682,7 +682,11 @@ fn render_text_spans(
         let sy = span.y.unwrap_or(cursor_y) + span.dy;
 
         let pos = ctx.vt.world_to_screen(world, sx, sy);
-        let screen_size = (font_size * ctx.vt.scale).max(4.0);
+        // Font size must account for both the viewport zoom and any scale baked into
+        // the element's world transform (e.g. transform="scale(2)").
+        let [a, b, c, d, ..] = world.matrix;
+        let world_scale = ((a * a + b * b).sqrt()).max((c * c + d * d).sqrt());
+        let screen_size = (font_size * world_scale * ctx.vt.scale).max(4.0);
         let font_id = egui::FontId::proportional(screen_size);
 
         let galley = ctx.painter.layout_no_wrap(span.content.clone(), font_id, color);

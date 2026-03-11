@@ -496,48 +496,29 @@ fn strip_url(s: &str) -> &str {
         .trim_start_matches('#')
 }
 
-fn build_attr_summary(node: &Node, tag: &str) -> String {
+fn build_attr_summary(node: &Node, _tag: &str) -> String {
+    // Emit every attribute on the element in document order.
+    // id and class get short-hand prefixes; everything else is name="value".
     let mut parts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
 
-    // Always include id if present
+    // id and class first, with their conventional short forms
     if let Some(id) = node.attribute("id") {
         parts.push(format!("#{id}"));
+        seen.insert("id");
     }
     if let Some(class) = node.attribute("class") {
-        parts.push(format!(".{}", class.split_whitespace().next().unwrap_or(class)));
+        parts.push(format!(".{class}"));
+        seen.insert("class");
     }
 
-    // Tag-specific key attributes
-    match tag {
-        "rect" => {
-            if let Some(w) = node.attribute("width") {
-                if let Some(h) = node.attribute("height") {
-                    parts.push(format!("{w}×{h}"));
-                }
-            }
+    // All remaining attributes in document order
+    for attr in node.attributes() {
+        let name = attr.name();
+        if seen.contains(name) {
+            continue;
         }
-        "circle" => {
-            if let Some(r) = node.attribute("r") {
-                parts.push(format!("r={r}"));
-            }
-        }
-        "path" => {
-            if let Some(d) = node.attribute("d") {
-                let snippet: String = d.chars().take(24).collect();
-                parts.push(format!("d=\"{snippet}…\""));
-            }
-        }
-        "text" => {
-            if let Some(t) = node.text() {
-                let snippet: String = t.chars().take(20).collect();
-                parts.push(format!("\"{snippet}\""));
-            }
-        }
-        "use" => {
-            let href = node.attribute("href").or_else(|| node.attribute("xlink:href")).unwrap_or("");
-            parts.push(format!("→{href}"));
-        }
-        _ => {}
+        parts.push(format!("{}=\"{}\"", name, attr.value()));
     }
 
     parts.join(" ")
