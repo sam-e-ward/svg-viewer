@@ -1,7 +1,7 @@
 /// SVG XML parser — converts raw XML bytes into an SvgDocument.
 /// Uses roxmltree for fast, zero-copy XML parsing.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use roxmltree::{Document, Node};
 use base64::Engine;
 
@@ -25,7 +25,26 @@ pub fn resolve_external_images(doc: &mut SvgDocument, svg_dir: Option<&std::path
 }
 
 pub fn parse_svg(source: &str) -> Result<SvgDocument> {
-    let doc = Document::parse(source).context("Failed to parse SVG XML")?;
+    let doc = Document::parse(source).map_err(|e| {
+        // roxmltree's error carries a position — show the offending source line.
+        let pos = e.pos();
+        let line_no = pos.row as usize; // 1-based
+        let col_no  = pos.col as usize; // 1-based
+        let src_line = source.lines().nth(line_no.saturating_sub(1)).unwrap_or("<unavailable>");
+        // Pointer line under the error column
+        let pointer = format!("{:>width$}", "^", width = col_no.max(1));
+        log::error!(
+            "SVG XML parse error at line {line_no}, col {col_no}: {e}\n  {src_line}\n  {pointer}"
+        );
+        // Also dump a ±3 line context window
+        let start = line_no.saturating_sub(4);
+        log::error!("Context (lines {start}–{}):", line_no + 2);
+        for (idx, l) in source.lines().enumerate().skip(start).take(7) {
+            let marker = if idx + 1 == line_no { ">>>" } else { "   " };
+            log::error!("  {marker} {:>4}: {l}", idx + 1);
+        }
+        anyhow::anyhow!("XML parse error at line {line_no}:{col_no}: {e}")
+    })?;
     let root_elem = doc.root_element();
 
     // We build nodes into a flat arena vec. Each node gets a NodeId = its index.
@@ -45,6 +64,22 @@ pub fn parse_svg(source: &str) -> Result<SvgDocument> {
         .iter()
         .filter_map(|n| n.svg_id.as_ref().map(|id| (id.clone(), n.id)))
         .collect();
+
+    // Count tags for a quick parse summary
+    let mut tag_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for n in &nodes {
+        *tag_counts.entry(n.tag_name.as_str()).or_insert(0) += 1;
+    }
+    let mut sorted_tags: Vec<(&str, usize)> = tag_counts.into_iter().collect();
+    sorted_tags.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let tag_summary: Vec<String> = sorted_tags.iter()
+        .map(|(t, n)| format!("{t}×{n}"))
+        .collect();
+    log::info!(
+        "parse_svg OK: {} nodes, {}×{}, viewBox={:?}. Tags: {}",
+        nodes.len(), width, height, view_box,
+        tag_summary.join(", ")
+    );
 
     Ok(SvgDocument {
         nodes,
@@ -67,12 +102,31 @@ fn build_node(
     let svg_id = xml_node.attribute("id").map(str::to_string);
     let class = xml_node.attribute("class").map(str::to_string);
 
+    log::trace!(
+        "build_node [{}] <{}> id={:?} class={:?}",
+        id.0, tag_name,
+        svg_id.as_deref().unwrap_or(""),
+        class.as_deref().unwrap_or("")
+    );
+
     let transform = parse_transform(xml_node.attribute("transform").unwrap_or(""));
     let style = parse_style(xml_node);
     let clip_path = xml_node.attribute("clip-path").map(|s| strip_url(s).to_string());
     let mask = xml_node.attribute("mask").map(|s| strip_url(s).to_string());
 
     let kind = parse_kind(xml_node, &tag_name);
+
+    // Warn on any element we mapped to Unknown (i.e. unsupported tag)
+    if let SvgNodeKind::Unknown { .. } = &kind {
+        let attrs: Vec<String> = xml_node.attributes()
+            .map(|a| format!("{}={:?}", a.name(), a.value()))
+            .collect();
+        log::debug!(
+            "Unknown element <{}> at node [{}] — attrs: [{}]",
+            tag_name, id.0, attrs.join(", ")
+        );
+    }
+
     let attr_summary = build_attr_summary(xml_node, &tag_name);
 
     // Push a placeholder — we'll fill children after recursing
@@ -162,15 +216,26 @@ fn parse_kind(node: &Node, tag: &str) -> SvgNodeKind {
         "polygon" => SvgNodeKind::Shape(SvgShape::Polygon {
             points: parse_points(node.attribute("points").unwrap_or("")),
         }),
-        "path" => SvgNodeKind::Shape(SvgShape::Path {
-            data: node.attribute("d").unwrap_or("").to_string(),
-        }),
+        "path" => {
+            let d = node.attribute("d").unwrap_or("");
+            if d.is_empty() {
+                log::warn!("parse_kind: <path> has empty or missing 'd' attribute (id={:?})",
+                    node.attribute("id").unwrap_or(""));
+            } else {
+                log::trace!("parse_kind: <path> d[..80]={:?}", &d[..d.len().min(80)]);
+            }
+            SvgNodeKind::Shape(SvgShape::Path { data: d.to_string() })
+        }
         "text" => {
             let x = parse_length_attr(node, "x").unwrap_or(0.0);
             let y = parse_length_attr(node, "y").unwrap_or(0.0);
             let font_size = parse_font_size(node).unwrap_or(16.0);
             let mut spans = Vec::new();
             collect_text_spans(node, font_size, None, None, &mut spans);
+            log::trace!(
+                "parse_kind: <text> x={x} y={y} font_size={font_size} spans={}",
+                spans.len()
+            );
             SvgNodeKind::Shape(SvgShape::Text { x, y, spans, font_size })
         }
         "image" => {
@@ -274,13 +339,17 @@ fn parse_paint(value: &str) -> Paint {
 
 pub fn parse_color(s: &str) -> Option<Color> {
     let s = s.trim();
-    if s.starts_with('#') {
+    let result = if s.starts_with('#') {
         parse_hex_color(s)
     } else if s.starts_with("rgb(") {
         parse_rgb_color(s)
     } else {
         named_color(s)
+    };
+    if result.is_none() && !s.is_empty() {
+        log::warn!("parse_color: unrecognised color value {:?} — treated as none", s);
     }
+    result
 }
 
 fn parse_hex_color(s: &str) -> Option<Color> {
@@ -455,15 +524,19 @@ fn parse_length_attr(node: &Node, attr: &str) -> Option<f32> {
 }
 
 pub fn parse_length(s: &str) -> Option<f32> {
-    let s = s.trim();
+    let orig = s.trim();
     // Strip common units — we treat everything as px/user units for now
-    let s = s
+    let s = orig
         .trim_end_matches("px")
         .trim_end_matches("pt")
         .trim_end_matches("em")
         .trim_end_matches("rem")
         .trim_end_matches('%');
-    s.parse().ok()
+    let result = s.parse().ok();
+    if result.is_none() && !orig.is_empty() {
+        log::warn!("parse_length: could not parse {:?} as a number", orig);
+    }
+    result
 }
 
 fn parse_view_box(s: &str) -> Option<[f32; 4]> {

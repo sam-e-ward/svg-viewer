@@ -3,8 +3,10 @@
 /// and coordinates between the renderer, spatial index, and elements pane.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 
 const MAX_RECENTS: usize = 10;
 const RECENTS_FILE: &str = "svg-viewer/recents.json";
@@ -18,6 +20,36 @@ use crate::renderer::{GeometryCache, RenderContext, ViewTransform};
 use crate::spatial_index::SpatialIndex;
 use crate::svg_doc::{NodeId, SvgDocument, SvgNodeKind, SvgShape};
 use crate::{parser, renderer};
+
+/// Progress state shared between the background loader and the UI thread.
+#[derive(Clone)]
+struct LoadProgress {
+    /// Human-readable description of the current phase
+    phase: String,
+    /// 0.0..1.0 for determinate progress, negative for indeterminate
+    fraction: f32,
+}
+
+impl LoadProgress {
+    fn indeterminate(phase: impl Into<String>) -> Self {
+        Self { phase: phase.into(), fraction: -1.0 }
+    }
+    fn determinate(phase: impl Into<String>, fraction: f32) -> Self {
+        Self { phase: phase.into(), fraction: fraction.clamp(0.0, 1.0) }
+    }
+}
+
+type SharedProgress = Arc<Mutex<LoadProgress>>;
+
+/// Everything produced by the background loader thread.
+struct LoadedDocument {
+    doc: SvgDocument,
+    spatial_index: SpatialIndex,
+    geometry_cache: GeometryCache,
+    clip_index: ClipIndex,
+    label: String,
+    svg_dir: Option<PathBuf>,
+}
 
 /// Which pane currently owns keyboard focus / spacebar behaviour.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,12 +127,12 @@ pub struct SvgViewerApp {
     url_modal_open: bool,
     /// Current text in the URL input field
     url_input: String,
-    /// Receives the result of a background load: Ok((svg_text, label, svg_dir)) or Err(msg)
-    load_rx: Option<Receiver<Result<(String, String, Option<PathBuf>), String>>>,
+    /// Receives the result of a background load
+    load_rx: Option<Receiver<Result<LoadedDocument, String>>>,
     /// True while a background load is in flight — shows the loading overlay
     is_loading: bool,
-    /// Human-readable description of what's being loaded (shown on loading screen)
-    loading_label: String,
+    /// Shared progress state, updated by the background thread
+    load_progress: SharedProgress,
     /// Error from the last failed load
     load_error: Option<String>,
 }
@@ -139,7 +171,7 @@ impl SvgViewerApp {
             url_input: String::new(),
             load_rx: None,
             is_loading: false,
-            loading_label: String::new(),
+            load_progress: Arc::new(Mutex::new(LoadProgress::indeterminate("Idle"))),
             load_error: None,
         }
     }
@@ -148,11 +180,23 @@ impl SvgViewerApp {
     fn load_file(&mut self, path: PathBuf, egui_ctx: Context) {
         let label = path.to_string_lossy().into_owned();
         let short = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        self.start_load(format!("Opening {short}…"), egui_ctx, move || {
+        self.start_load(format!("Opening {short}…"), egui_ctx, move |progress, ctx| {
+            // Phase 1: Read the file with progress
+            set_progress_and_repaint(&progress, LoadProgress::indeterminate("Reading file…"), &ctx);
+            let file_len = std::fs::metadata(&path).ok().map(|m| m.len());
             let svg_dir = path.parent().map(|p| p.to_path_buf());
-            std::fs::read_to_string(&path)
-                .map(|text| (text, label, svg_dir))
-                .map_err(|e| format!("Read error: {e}"))
+
+            let contents = if let Some(total) = file_len {
+                let mut file = std::fs::File::open(&path)
+                    .map_err(|e| format!("Read error: {e}"))?;
+                read_with_progress(&mut file, total as usize, "Reading file…", &progress, &ctx)?
+            } else {
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("Read error: {e}"))?
+            };
+
+            // Phases 2-5: parse and build indexes
+            parse_and_build(contents, label, svg_dir, &progress, &ctx)
         });
     }
 
@@ -160,65 +204,71 @@ impl SvgViewerApp {
     fn start_url_fetch(&mut self, url: String, egui_ctx: Context) {
         let label = url.clone();
         self.url_modal_open = false;
-        self.start_load(format!("Downloading…"), egui_ctx, move || {
-            ureq::get(&url)
+        self.start_load(format!("Downloading…"), egui_ctx, move |progress, ctx| {
+            // Phase 1: Download with progress
+            set_progress_and_repaint(&progress, LoadProgress::indeterminate("Connecting…"), &ctx);
+            let resp = ureq::get(&url)
                 .set("User-Agent", "svg-viewer/1.0")
                 .call()
-                .map_err(|e| format!("Request failed: {e}"))
-                .and_then(|resp| resp.into_string().map_err(|e| format!("Read error: {e}")))
-                .map(|text| (text, label, None))
+                .map_err(|e| format!("Request failed: {e}"))?;
+
+            let content_length: Option<usize> = resp.header("Content-Length")
+                .and_then(|s| s.parse().ok());
+
+            let contents = if let Some(total) = content_length {
+                read_with_progress(&mut resp.into_reader(), total, "Downloading…", &progress, &ctx)?
+            } else {
+                set_progress_and_repaint(&progress, LoadProgress::indeterminate("Downloading…"), &ctx);
+                let mut buf = String::new();
+                resp.into_reader()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| format!("Read error: {e}"))?;
+                buf
+            };
+
+            // Phases 2-5: parse and build indexes
+            parse_and_build(contents, label, None, &progress, &ctx)
         });
     }
 
-    /// Generic background loader.  `work` runs on a thread, returns (text, label, svg_dir).
+    /// Generic background loader.  `work` runs on a thread and receives shared progress + context.
     fn start_load<F>(&mut self, description: String, egui_ctx: Context, work: F)
     where
-        F: FnOnce() -> Result<(String, String, Option<PathBuf>), String> + Send + 'static,
+        F: FnOnce(SharedProgress, Context) -> Result<LoadedDocument, String> + Send + 'static,
     {
         let (tx, rx) = mpsc::channel();
         self.load_rx = Some(rx);
         self.is_loading = true;
-        self.loading_label = description;
         self.load_error = None;
 
+        let progress = Arc::new(Mutex::new(LoadProgress::indeterminate(&description)));
+        self.load_progress = progress.clone();
+
+        let ctx2 = egui_ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(work());
-            egui_ctx.request_repaint();
+            let _ = tx.send(work(progress, ctx2.clone()));
+            ctx2.request_repaint();
         });
     }
 
-    /// Core loader — parses SVG text, builds all indexes, resets view state.
-    fn load_from_svg_text(&mut self, contents: String, label: String, svg_dir: Option<PathBuf>) {
-        match parser::parse_svg(&contents) {
-            Ok(mut doc) => {
-                parser::resolve_external_images(&mut doc, svg_dir.as_deref());
-
-                self.textures.clear();
-                let index = SpatialIndex::build(&doc);
-                let cache = GeometryCache::build(&doc);
-                let clips = ClipIndex::build(&doc);
-                log::info!("Loaded \"{label}\": {} nodes", doc.nodes.len());
-                self.spatial_index = Some(index);
-                self.geometry_cache = cache;
-                self.clip_index = clips;
-                self.doc = Some(doc);
-                self.error = None;
-                self.view_fitted = false;
-                self.highlighted = None;
-                self.highlight_transient = false;
-                self.group_highlight_bbox = None;
-                self.tab_candidates.clear();
-                self.tab_index = 0;
-                self.tab_cursor_pos = None;
-                self.elements_pane = ElementsPane::new();
-                self.file_path = Some(PathBuf::from(label.clone()));
-                self.push_recent(label);
-            }
-            Err(e) => {
-                self.error = Some(format!("Parse error: {e}"));
-                self.doc = None;
-            }
-        }
+    /// Install a fully-loaded document produced by the background thread.
+    fn install_loaded_document(&mut self, loaded: LoadedDocument) {
+        self.textures.clear();
+        self.spatial_index = Some(loaded.spatial_index);
+        self.geometry_cache = loaded.geometry_cache;
+        self.clip_index = loaded.clip_index;
+        self.doc = Some(loaded.doc);
+        self.error = None;
+        self.view_fitted = false;
+        self.highlighted = None;
+        self.highlight_transient = false;
+        self.group_highlight_bbox = None;
+        self.tab_candidates.clear();
+        self.tab_index = 0;
+        self.tab_cursor_pos = None;
+        self.elements_pane = ElementsPane::new();
+        self.file_path = Some(PathBuf::from(loaded.label.clone()));
+        self.push_recent(loaded.label);
     }
 
     /// Upload any decoded image pixels to egui textures.
@@ -398,6 +448,104 @@ fn parse_json_string_array(text: &str) -> Vec<String> {
     items
 }
 
+// ---------------------------------------------------------------------------
+// Background-thread helpers
+// ---------------------------------------------------------------------------
+
+fn set_progress(progress: &SharedProgress, p: LoadProgress) {
+    if let Ok(mut guard) = progress.lock() {
+        *guard = p;
+    }
+}
+
+/// Helper: set progress and request a repaint so the UI updates promptly.
+fn set_progress_and_repaint(progress: &SharedProgress, p: LoadProgress, ctx: &Context) {
+    set_progress(progress, p);
+    ctx.request_repaint();
+}
+
+/// Format a byte progress like "3.2 / 14.1 MB".
+fn format_bytes_progress(done: usize, total: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let d = done as f64;
+    let t = total as f64;
+    if t >= MB {
+        format!("{:.1} / {:.1} MB", d / MB, t / MB)
+    } else if t >= KB {
+        format!("{:.0} / {:.0} KB", d / KB, t / KB)
+    } else {
+        format!("{done} / {total} B")
+    }
+}
+
+/// Read from `reader` in chunks, building a String, reporting progress.
+fn read_with_progress(
+    reader: &mut dyn Read,
+    total: usize,
+    phase: &str,
+    progress: &SharedProgress,
+    ctx: &Context,
+) -> Result<String, String> {
+    let mut buf = Vec::with_capacity(total);
+    let mut chunk = [0u8; 64 * 1024];
+    let mut last_repaint = std::time::Instant::now();
+    loop {
+        let n = reader.read(&mut chunk).map_err(|e| format!("Read error: {e}"))?;
+        if n == 0 { break; }
+        buf.extend_from_slice(&chunk[..n]);
+        let frac = if total > 0 { buf.len() as f32 / total as f32 } else { -1.0 };
+        let size_label = format_bytes_progress(buf.len(), total);
+        set_progress(progress, LoadProgress::determinate(
+            format!("{phase} ({size_label})"), frac,
+        ));
+        // Throttle repaints to ~30fps to avoid overwhelming the UI
+        if last_repaint.elapsed().as_millis() > 33 {
+            ctx.request_repaint();
+            last_repaint = std::time::Instant::now();
+        }
+    }
+    ctx.request_repaint();
+    String::from_utf8(buf).map_err(|e| format!("UTF-8 error: {e}"))
+}
+
+/// Parse SVG text and build all indexes, reporting progress phases.
+fn parse_and_build(
+    contents: String,
+    label: String,
+    svg_dir: Option<PathBuf>,
+    progress: &SharedProgress,
+    ctx: &Context,
+) -> Result<LoadedDocument, String> {
+    // Phase: Parse
+    set_progress_and_repaint(progress, LoadProgress::indeterminate("Parsing SVG…"), ctx);
+    let mut doc = parser::parse_svg(&contents).map_err(|e| {
+        let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+        format!("Parse error: {}", chain.join("\n  caused by: "))
+    })?;
+
+    // Phase: Resolve external images
+    set_progress_and_repaint(progress, LoadProgress::indeterminate("Resolving images…"), ctx);
+    parser::resolve_external_images(&mut doc, svg_dir.as_deref());
+
+    // Phase: Build spatial index
+    set_progress_and_repaint(progress, LoadProgress::indeterminate("Building spatial index…"), ctx);
+    let spatial_index = SpatialIndex::build(&doc);
+
+    // Phase: Build geometry cache
+    set_progress_and_repaint(progress, LoadProgress::indeterminate("Tessellating geometry…"), ctx);
+    let geometry_cache = GeometryCache::build(&doc);
+
+    // Phase: Build clip index
+    set_progress_and_repaint(progress, LoadProgress::indeterminate("Building clip index…"), ctx);
+    let clip_index = ClipIndex::build(&doc);
+
+    log::info!("Loaded \"{label}\": {} nodes", doc.nodes.len());
+    set_progress_and_repaint(progress, LoadProgress::determinate("Done", 1.0), ctx);
+
+    Ok(LoadedDocument { doc, spatial_index, geometry_cache, clip_index, label, svg_dir })
+}
+
 impl eframe::App for SvgViewerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         // -- Poll background load (file or URL) --
@@ -406,8 +554,8 @@ impl eframe::App for SvgViewerApp {
                 self.load_rx = None;
                 self.is_loading = false;
                 match result {
-                    Ok((svg_text, label, svg_dir)) => {
-                        self.load_from_svg_text(svg_text, label, svg_dir);
+                    Ok(loaded) => {
+                        self.install_loaded_document(loaded);
                     }
                     Err(e) => {
                         self.load_error = Some(e);
@@ -717,15 +865,29 @@ impl eframe::App for SvgViewerApp {
 
             // -- Loading overlay (file read / URL fetch in progress) --
             if self.is_loading {
+                let progress = self.load_progress.lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|_| LoadProgress::indeterminate("Loading…"));
+
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
-                        ui.add(egui::Spinner::new().size(40.0));
+
+                        if progress.fraction >= 0.0 {
+                            // Determinate progress bar
+                            let bar = egui::ProgressBar::new(progress.fraction)
+                                .show_percentage();
+                            ui.add_sized([300.0, 20.0], bar);
+                        } else {
+                            // Indeterminate spinner
+                            ui.add(egui::Spinner::new().size(40.0));
+                        }
+
                         ui.add_space(16.0);
-                        ui.label(egui::RichText::new(&self.loading_label).size(16.0));
+                        ui.label(egui::RichText::new(&progress.phase).size(16.0));
                     });
                 });
-                // Keep repainting while loading so the spinner animates
+                // Keep repainting while loading so the progress updates
                 ctx.request_repaint();
                 return;
             }
@@ -951,6 +1113,7 @@ impl eframe::App for SvgViewerApp {
                     textures: &self.textures,
                     cache: &self.geometry_cache,
                     clips: &self.clip_index,
+                    vertices_emitted: std::rc::Rc::new(std::cell::Cell::new(0)),
                 };
                 renderer::render(&render_ctx);
             }

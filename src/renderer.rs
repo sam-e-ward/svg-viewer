@@ -9,7 +9,9 @@
 
 use egui::{Color32, Painter, Pos2, Rect, Stroke, TextureHandle};
 use egui::epaint::StrokeKind;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use crate::clip_index::ClipIndex;
 use lyon::geom::point;
 use lyon::math::Point;
@@ -134,11 +136,17 @@ impl RawMesh {
     }
 
     /// Emit this mesh to egui, applying the combined world+view transform
-    /// and tinting with `color`.
-    pub fn emit(&self, painter: &Painter, world: &Transform, vt: &ViewTransform, color: Color32) {
+    /// and tinting with `color`. Returns false if the vertex budget was exceeded.
+    pub fn emit(&self, painter: &Painter, world: &Transform, vt: &ViewTransform, color: Color32, budget: &Cell<usize>) -> bool {
         if self.vertices.is_empty() {
-            return;
+            return true;
         }
+        let count = self.vertices.len();
+        let used = budget.get();
+        if used + count > VERTEX_BUDGET {
+            return false;
+        }
+        budget.set(used + count);
         let verts: Vec<egui::epaint::Vertex> = self
             .vertices
             .iter()
@@ -156,6 +164,7 @@ impl RawMesh {
             indices: self.indices.clone(),
             texture_id: egui::TextureId::default(),
         }));
+        true
     }
 }
 
@@ -213,6 +222,10 @@ impl GeometryCache {
 // Render context
 // ---------------------------------------------------------------------------
 
+/// Maximum vertices per frame. Each egui::epaint::Vertex is 20 bytes;
+/// wgpu's max buffer is 256 MB ≈ 13.4M vertices. We stay well under that.
+const VERTEX_BUDGET: usize = 10_000_000;
+
 pub struct RenderContext<'a> {
     pub doc: &'a SvgDocument,
     pub vt: &'a ViewTransform,
@@ -226,6 +239,8 @@ pub struct RenderContext<'a> {
     pub textures: &'a HashMap<NodeId, TextureHandle>,
     pub cache: &'a GeometryCache,
     pub clips: &'a ClipIndex,
+    /// Running count of vertices emitted this frame (shared across clipped sub-contexts).
+    pub vertices_emitted: Rc<Cell<usize>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +270,11 @@ pub fn render(ctx: &RenderContext) {
 }
 
 fn render_node(ctx: &RenderContext, node_id: NodeId, parent_tf: &Transform) {
+    // Early out if vertex budget is exhausted
+    if ctx.vertices_emitted.get() >= VERTEX_BUDGET {
+        return;
+    }
+
     let node = ctx.doc.get(node_id);
     let world = parent_tf.concat(&node.transform);
 
@@ -294,6 +314,7 @@ fn render_node(ctx: &RenderContext, node_id: NodeId, parent_tf: &Transform) {
                 textures: ctx.textures,
                 cache: ctx.cache,
                 clips: ctx.clips,
+                vertices_emitted: ctx.vertices_emitted.clone(),
             };
             &clipped_ctx
         } else {
@@ -470,10 +491,10 @@ fn render_shape(ctx: &RenderContext, node: &SvgNode, shape: &SvgShape, world: &T
                 if !visible { return; }
 
                 if let Some(fill) = fill_color {
-                    if let Some(m) = &geom.fill { m.emit(ctx.painter, world, ctx.vt, fill); }
+                    if let Some(m) = &geom.fill { m.emit(ctx.painter, world, ctx.vt, fill, &ctx.vertices_emitted); }
                 }
                 if let Some(sc) = stroke_color {
-                    if let Some(m) = &geom.stroke { m.emit(ctx.painter, world, ctx.vt, sc); }
+                    if let Some(m) = &geom.stroke { m.emit(ctx.painter, world, ctx.vt, sc, &ctx.vertices_emitted); }
                 }
             }
         }
@@ -601,10 +622,10 @@ fn render_highlight(ctx: &RenderContext, node_id: NodeId) {
         | SvgShape::Polygon { .. } | SvgShape::Polyline { .. } => {
             if let Some(geom) = ctx.cache.meshes.get(&node_id) {
                 if let Some(m) = &geom.fill {
-                    m.emit(ctx.painter, &world, ctx.vt, hl_fill);
+                    m.emit(ctx.painter, &world, ctx.vt, hl_fill, &ctx.vertices_emitted);
                 }
                 if let Some(m) = &geom.stroke {
-                    m.emit(ctx.painter, &world, ctx.vt, hl_stroke);
+                    m.emit(ctx.painter, &world, ctx.vt, hl_stroke, &ctx.vertices_emitted);
                 }
                 // Stroke-only shapes with no cached fill mesh: draw the stroke in highlight colour
                 if geom.fill.is_none() && geom.stroke.is_none() {
