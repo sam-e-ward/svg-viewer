@@ -191,6 +191,11 @@ impl GeometryCache {
         let node = doc.get(node_id);
         let world = parent_tf.concat(&node.transform);
 
+        // Skip filtered nodes entirely — no tessellation needed
+        if node.filtered {
+            return;
+        }
+
         match &node.kind {
             SvgNodeKind::Svg { .. } | SvgNodeKind::Group => {
                 for &child in &node.children {
@@ -323,6 +328,11 @@ fn render_node(ctx: &RenderContext, node_id: NodeId, parent_tf: &Transform) {
     } else {
         ctx
     };
+
+    // Skip filtered nodes — they were excluded to keep large SVGs renderable
+    if node.filtered {
+        return;
+    }
 
     match &node.kind {
         SvgNodeKind::Svg { .. } | SvgNodeKind::Group => {

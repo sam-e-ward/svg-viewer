@@ -5,6 +5,7 @@ mod renderer;
 mod elements_pane;
 mod spatial_index;
 mod clip_index;
+mod filter;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();

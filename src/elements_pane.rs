@@ -66,6 +66,13 @@ impl ElementsPane {
         hovered: &mut Option<NodeId>,
     ) {
         let node = doc.get(node_id);
+
+        // Skip filtered nodes entirely — they can number in the hundreds of
+        // thousands and would freeze the UI if we tried to lay out rows for all of them.
+        if node.filtered {
+            return;
+        }
+
         let is_leaf = node.children.is_empty();
         let is_collapsed = self.collapsed.contains(&node_id);
         let is_selected = self.selected == Some(node_id);
@@ -174,6 +181,23 @@ impl ElementsPane {
         if !is_collapsed {
             for &child in &node.children.clone() {
                 self.show_node(ui, doc, child, depth + 1, clicked, hovered);
+            }
+        }
+    }
+
+    /// Pre-collapse groups with many visible (non-filtered) children.
+    /// Called once after loading a large document to prevent the tree from
+    /// overwhelming the UI on first render.
+    pub fn auto_collapse_large_groups(&mut self, doc: &SvgDocument) {
+        const COLLAPSE_THRESHOLD: usize = 200;
+        for node in &doc.nodes {
+            if !node.children.is_empty() {
+                let visible_children = node.children.iter()
+                    .filter(|&&c| !doc.get(c).filtered)
+                    .count();
+                if visible_children > COLLAPSE_THRESHOLD {
+                    self.collapsed.insert(node.id);
+                }
             }
         }
     }

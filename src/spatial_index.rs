@@ -184,7 +184,7 @@ fn collect_entries(
                 collect_entries(doc, child, &world, entries);
             }
         }
-        SvgNodeKind::Shape(shape) => {
+        SvgNodeKind::Shape(shape) if !node.filtered => {
             let stroke_width = match &node.style.stroke {
                 Paint::None => 0.0,
                 _ => node.style.stroke_width,
@@ -202,7 +202,7 @@ fn collect_entries(
                 });
             }
         }
-        // Defs, clipPath, mask etc. are not hit-testable
+        // Defs, clipPath, mask, filtered shapes etc. are not hit-testable
         _ => {}
     }
 }

@@ -143,6 +143,7 @@ fn build_node(
         children: Vec::new(),
         parent,
         attr_summary,
+        filtered: false,
     });
 
     let child_ids: Vec<NodeId> = xml_node

@@ -251,6 +251,8 @@ pub struct SvgNode {
     pub parent: Option<NodeId>,
     /// A short human-readable attribute summary for display in the elements pane
     pub attr_summary: String,
+    /// True if this node was filtered out to reduce element count for large SVGs
+    pub filtered: bool,
 }
 
 /// The full parsed SVG document.

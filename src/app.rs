@@ -19,27 +19,92 @@ use crate::elements_pane::ElementsPane;
 use crate::renderer::{GeometryCache, RenderContext, ViewTransform};
 use crate::spatial_index::SpatialIndex;
 use crate::svg_doc::{NodeId, SvgDocument, SvgNodeKind, SvgShape};
-use crate::{parser, renderer};
+use crate::{filter, parser, renderer};
+
+/// A single completed phase in the loading log.
+#[derive(Clone)]
+struct PhaseEntry {
+    label: String,
+    duration: std::time::Duration,
+}
 
 /// Progress state shared between the background loader and the UI thread.
 #[derive(Clone)]
 struct LoadProgress {
-    /// Human-readable description of the current phase
+    /// Human-readable description of the current (in-progress) phase
     phase: String,
     /// 0.0..1.0 for determinate progress, negative for indeterminate
     fraction: f32,
+    /// Completed phases with timing
+    completed: Vec<PhaseEntry>,
+    /// Whether loading is fully done
+    done: bool,
 }
 
 impl LoadProgress {
-    fn indeterminate(phase: impl Into<String>) -> Self {
-        Self { phase: phase.into(), fraction: -1.0 }
-    }
-    fn determinate(phase: impl Into<String>, fraction: f32) -> Self {
-        Self { phase: phase.into(), fraction: fraction.clamp(0.0, 1.0) }
+    fn new() -> Self {
+        Self { phase: String::new(), fraction: -1.0, completed: Vec::new(), done: false }
     }
 }
 
 type SharedProgress = Arc<Mutex<LoadProgress>>;
+
+/// Helper to time phases and accumulate a log of completed steps.
+struct PhaseTimer {
+    progress: SharedProgress,
+    ctx: Context,
+    current_label: String,
+    started: std::time::Instant,
+}
+
+impl PhaseTimer {
+    fn new(progress: SharedProgress, ctx: Context) -> Self {
+        Self {
+            progress,
+            ctx,
+            current_label: String::new(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Start a new indeterminate phase. Finishes the previous phase if any.
+    fn begin(&mut self, label: impl Into<String>) {
+        self.finish_current();
+        self.current_label = label.into();
+        self.started = std::time::Instant::now();
+        if let Ok(mut guard) = self.progress.lock() {
+            guard.phase = self.current_label.clone();
+            guard.fraction = -1.0;
+        }
+        self.ctx.request_repaint();
+    }
+
+    /// Finish the current phase and log it as completed with its duration.
+    fn finish_current(&mut self) {
+        if !self.current_label.is_empty() {
+            let duration = self.started.elapsed();
+            if let Ok(mut guard) = self.progress.lock() {
+                guard.completed.push(PhaseEntry {
+                    label: self.current_label.clone(),
+                    duration,
+                });
+            }
+        }
+    }
+
+    /// Mark loading as fully done. Finishes the current phase.
+    fn done(&mut self) {
+        self.finish_current();
+        self.current_label.clear();
+        if let Ok(mut guard) = self.progress.lock() {
+            guard.phase = "Done".to_string();
+            guard.fraction = 1.0;
+            guard.done = true;
+        }
+        self.ctx.request_repaint();
+    }
+
+}
 
 /// Everything produced by the background loader thread.
 struct LoadedDocument {
@@ -49,6 +114,7 @@ struct LoadedDocument {
     clip_index: ClipIndex,
     label: String,
     svg_dir: Option<PathBuf>,
+    filter_report: Option<filter::FilterReport>,
 }
 
 /// Which pane currently owns keyboard focus / spacebar behaviour.
@@ -119,6 +185,14 @@ pub struct SvgViewerApp {
     /// egui context used for texture uploads (stored after first frame)
     egui_ctx: Option<Context>,
 
+    // --- Filter report ---
+    /// If the document was too large and elements were filtered, this holds the report.
+    filter_report: Option<filter::FilterReport>,
+
+    // --- First-render timing ---
+    /// Set when the loaded document is installed; cleared after first render frame
+    install_time: Option<std::time::Instant>,
+
     // --- Recent files / URLs ---
     recent_items: Vec<String>,
 
@@ -166,12 +240,14 @@ impl SvgViewerApp {
             clip_index: ClipIndex { clips: std::collections::HashMap::new() },
             textures: HashMap::new(),
             egui_ctx: None,
+            filter_report: None,
+            install_time: None,
             recent_items: load_recents(),
             url_modal_open: false,
             url_input: String::new(),
             load_rx: None,
             is_loading: false,
-            load_progress: Arc::new(Mutex::new(LoadProgress::indeterminate("Idle"))),
+            load_progress: Arc::new(Mutex::new(LoadProgress::new())),
             load_error: None,
         }
     }
@@ -179,12 +255,18 @@ impl SvgViewerApp {
     /// Kick off a background file read + parse.  Shows the loading overlay immediately.
     fn load_file(&mut self, path: PathBuf, egui_ctx: Context) {
         let label = path.to_string_lossy().into_owned();
-        let short = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        self.start_load(format!("Opening {short}…"), egui_ctx, move |progress, ctx| {
-            // Phase 1: Read the file with progress
-            set_progress_and_repaint(&progress, LoadProgress::indeterminate("Reading file…"), &ctx);
+        self.start_load(format!("Opening…"), egui_ctx, move |progress, ctx| {
+            let mut timer = PhaseTimer::new(progress.clone(), ctx.clone());
+
             let file_len = std::fs::metadata(&path).ok().map(|m| m.len());
             let svg_dir = path.parent().map(|p| p.to_path_buf());
+
+            let size_label = file_len.map(|s| {
+                if s >= 1024 * 1024 { format!(" ({:.1} MB)", s as f64 / (1024.0 * 1024.0)) }
+                else if s >= 1024 { format!(" ({:.0} KB)", s as f64 / 1024.0) }
+                else { format!(" ({s} B)") }
+            }).unwrap_or_default();
+            timer.begin(format!("Reading file{size_label}"));
 
             let contents = if let Some(total) = file_len {
                 let mut file = std::fs::File::open(&path)
@@ -195,8 +277,8 @@ impl SvgViewerApp {
                     .map_err(|e| format!("Read error: {e}"))?
             };
 
-            // Phases 2-5: parse and build indexes
-            parse_and_build(contents, label, svg_dir, &progress, &ctx)
+            // Phases 2+: parse and build indexes
+            parse_and_build(contents, label, svg_dir, &mut timer)
         });
     }
 
@@ -205,8 +287,9 @@ impl SvgViewerApp {
         let label = url.clone();
         self.url_modal_open = false;
         self.start_load(format!("Downloading…"), egui_ctx, move |progress, ctx| {
-            // Phase 1: Download with progress
-            set_progress_and_repaint(&progress, LoadProgress::indeterminate("Connecting…"), &ctx);
+            let mut timer = PhaseTimer::new(progress.clone(), ctx.clone());
+
+            timer.begin("Connecting…");
             let resp = ureq::get(&url)
                 .set("User-Agent", "svg-viewer/1.0")
                 .call()
@@ -215,10 +298,10 @@ impl SvgViewerApp {
             let content_length: Option<usize> = resp.header("Content-Length")
                 .and_then(|s| s.parse().ok());
 
+            timer.begin("Downloading…");
             let contents = if let Some(total) = content_length {
                 read_with_progress(&mut resp.into_reader(), total, "Downloading…", &progress, &ctx)?
             } else {
-                set_progress_and_repaint(&progress, LoadProgress::indeterminate("Downloading…"), &ctx);
                 let mut buf = String::new();
                 resp.into_reader()
                     .read_to_string(&mut buf)
@@ -226,13 +309,13 @@ impl SvgViewerApp {
                 buf
             };
 
-            // Phases 2-5: parse and build indexes
-            parse_and_build(contents, label, None, &progress, &ctx)
+            // Phases 2+: parse and build indexes
+            parse_and_build(contents, label, None, &mut timer)
         });
     }
 
     /// Generic background loader.  `work` runs on a thread and receives shared progress + context.
-    fn start_load<F>(&mut self, description: String, egui_ctx: Context, work: F)
+    fn start_load<F>(&mut self, _description: String, egui_ctx: Context, work: F)
     where
         F: FnOnce(SharedProgress, Context) -> Result<LoadedDocument, String> + Send + 'static,
     {
@@ -241,7 +324,7 @@ impl SvgViewerApp {
         self.is_loading = true;
         self.load_error = None;
 
-        let progress = Arc::new(Mutex::new(LoadProgress::indeterminate(&description)));
+        let progress = Arc::new(Mutex::new(LoadProgress::new()));
         self.load_progress = progress.clone();
 
         let ctx2 = egui_ctx.clone();
@@ -257,8 +340,10 @@ impl SvgViewerApp {
         self.spatial_index = Some(loaded.spatial_index);
         self.geometry_cache = loaded.geometry_cache;
         self.clip_index = loaded.clip_index;
+        self.filter_report = loaded.filter_report;
         self.doc = Some(loaded.doc);
         self.error = None;
+        self.install_time = Some(std::time::Instant::now());
         self.view_fitted = false;
         self.highlighted = None;
         self.highlight_transient = false;
@@ -267,6 +352,11 @@ impl SvgViewerApp {
         self.tab_index = 0;
         self.tab_cursor_pos = None;
         self.elements_pane = ElementsPane::new();
+        if let Some(ref report) = self.filter_report {
+            if report.filtered_count > 0 {
+                self.elements_pane.auto_collapse_large_groups(self.doc.as_ref().unwrap());
+            }
+        }
         self.file_path = Some(PathBuf::from(loaded.label.clone()));
         self.push_recent(loaded.label);
     }
@@ -452,16 +542,14 @@ fn parse_json_string_array(text: &str) -> Vec<String> {
 // Background-thread helpers
 // ---------------------------------------------------------------------------
 
-fn set_progress(progress: &SharedProgress, p: LoadProgress) {
-    if let Ok(mut guard) = progress.lock() {
-        *guard = p;
+/// Format a duration for display: "1.23s", "456ms", etc.
+fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms >= 1000 {
+        format!("{:.2}s", d.as_secs_f64())
+    } else {
+        format!("{ms}ms")
     }
-}
-
-/// Helper: set progress and request a repaint so the UI updates promptly.
-fn set_progress_and_repaint(progress: &SharedProgress, p: LoadProgress, ctx: &Context) {
-    set_progress(progress, p);
-    ctx.request_repaint();
 }
 
 /// Format a byte progress like "3.2 / 14.1 MB".
@@ -480,6 +568,8 @@ fn format_bytes_progress(done: usize, total: usize) -> String {
 }
 
 /// Read from `reader` in chunks, building a String, reporting progress.
+/// Updates the current phase label/fraction in the shared progress without
+/// disturbing the completed-phase log.
 fn read_with_progress(
     reader: &mut dyn Read,
     total: usize,
@@ -496,9 +586,10 @@ fn read_with_progress(
         buf.extend_from_slice(&chunk[..n]);
         let frac = if total > 0 { buf.len() as f32 / total as f32 } else { -1.0 };
         let size_label = format_bytes_progress(buf.len(), total);
-        set_progress(progress, LoadProgress::determinate(
-            format!("{phase} ({size_label})"), frac,
-        ));
+        if let Ok(mut guard) = progress.lock() {
+            guard.phase = format!("{phase} ({size_label})");
+            guard.fraction = frac;
+        }
         // Throttle repaints to ~30fps to avoid overwhelming the UI
         if last_repaint.elapsed().as_millis() > 33 {
             ctx.request_repaint();
@@ -514,36 +605,62 @@ fn parse_and_build(
     contents: String,
     label: String,
     svg_dir: Option<PathBuf>,
-    progress: &SharedProgress,
-    ctx: &Context,
+    timer: &mut PhaseTimer,
 ) -> Result<LoadedDocument, String> {
     // Phase: Parse
-    set_progress_and_repaint(progress, LoadProgress::indeterminate("Parsing SVG…"), ctx);
+    let contents_len = contents.len();
+    timer.begin(format!("Parsing SVG ({:.1} MB)…", contents_len as f64 / (1024.0 * 1024.0)));
     let mut doc = parser::parse_svg(&contents).map_err(|e| {
         let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
         format!("Parse error: {}", chain.join("\n  caused by: "))
     })?;
+    drop(contents); // free the source string early
+
+    let total_nodes = doc.nodes.len();
+    let shape_count: usize = doc.nodes.iter()
+        .filter(|n| matches!(&n.kind, SvgNodeKind::Shape(_)))
+        .count();
 
     // Phase: Resolve external images
-    set_progress_and_repaint(progress, LoadProgress::indeterminate("Resolving images…"), ctx);
+    timer.begin(format!("Resolving images… ({total_nodes} nodes, {shape_count} shapes)"));
     parser::resolve_external_images(&mut doc, svg_dir.as_deref());
 
+    // Phase: Filter large SVGs
+    timer.begin(format!("Analysing element density… ({shape_count} shapes)"));
+    let filter_report = filter::filter_large_svg(&mut doc);
+    if let Some(ref report) = filter_report {
+        let remaining = report.total_shapes - report.filtered_count;
+        // Update the current phase label so the filter result shows in the log
+        timer.begin(format!(
+            "Filtered: {} → {} shapes ({} removed across {} groups)",
+            report.total_shapes, remaining, report.filtered_count, report.groups.len()
+        ));
+        // Immediately finish this "phase" so it appears in the log
+        timer.finish_current();
+        // Clear current_label so finish_current isn't called again
+        timer.current_label.clear();
+    }
+
+    let active_shapes: usize = doc.nodes.iter()
+        .filter(|n| matches!(&n.kind, SvgNodeKind::Shape(_)) && !n.filtered)
+        .count();
+
     // Phase: Build spatial index
-    set_progress_and_repaint(progress, LoadProgress::indeterminate("Building spatial index…"), ctx);
+    timer.begin(format!("Building spatial index… ({active_shapes} active shapes)"));
     let spatial_index = SpatialIndex::build(&doc);
 
     // Phase: Build geometry cache
-    set_progress_and_repaint(progress, LoadProgress::indeterminate("Tessellating geometry…"), ctx);
+    timer.begin(format!("Tessellating geometry… ({active_shapes} active shapes)"));
     let geometry_cache = GeometryCache::build(&doc);
 
     // Phase: Build clip index
-    set_progress_and_repaint(progress, LoadProgress::indeterminate("Building clip index…"), ctx);
+    timer.begin("Building clip index…");
     let clip_index = ClipIndex::build(&doc);
 
-    log::info!("Loaded \"{label}\": {} nodes", doc.nodes.len());
-    set_progress_and_repaint(progress, LoadProgress::determinate("Done", 1.0), ctx);
+    log::info!("Loaded \"{label}\": {} nodes, {} active shapes", doc.nodes.len(), active_shapes);
+    timer.done();
 
-    Ok(LoadedDocument { doc, spatial_index, geometry_cache, clip_index, label, svg_dir })
+    Ok(LoadedDocument { doc, spatial_index, geometry_cache, clip_index, label, svg_dir, filter_report })
 }
 
 impl eframe::App for SvgViewerApp {
@@ -671,6 +788,37 @@ impl eframe::App for SvgViewerApp {
                                     });
                                 }
                             });
+                        }
+
+                        // Filter indicator
+                        if let Some(report) = &self.filter_report {
+                            ui.separator();
+                            let pct = (report.filtered_count as f32 / report.total_shapes as f32 * 100.0) as u32;
+                            let filter_label = ui.label(
+                                egui::RichText::new(format!("⚠ {}% filtered", pct))
+                                    .monospace()
+                                    .color(Color32::from_rgb(220, 160, 0))
+                            );
+                            if filter_label.hovered() {
+                                egui::show_tooltip_at_pointer(ctx, ui.layer_id(), egui::Id::new("filter_breakdown"), |ui| {
+                                    ui.set_min_width(280.0);
+                                    ui.label(egui::RichText::new(format!(
+                                        "Large SVG: {} elements detected.\n{} elements filtered to prevent crashes.",
+                                        report.total_shapes, report.filtered_count
+                                    )).strong());
+                                    ui.add_space(6.0);
+                                    ui.label("Filtered style groups:");
+                                    ui.add_space(4.0);
+                                    for (desc, original, kept) in &report.groups {
+                                        let group_pct = ((*original - *kept) as f32 / *original as f32 * 100.0) as u32;
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(format!("{kept}/{original}")).monospace().strong());
+                                            ui.label(egui::RichText::new(format!("kept ({group_pct}% removed)")).monospace().weak());
+                                        });
+                                        ui.label(egui::RichText::new(format!("  {desc}")).monospace().weak());
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -867,26 +1015,59 @@ impl eframe::App for SvgViewerApp {
             if self.is_loading {
                 let progress = self.load_progress.lock()
                     .map(|g| g.clone())
-                    .unwrap_or_else(|_| LoadProgress::indeterminate("Loading…"));
+                    .unwrap_or_else(|_| LoadProgress::new());
 
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
+                ui.vertical(|ui| {
+                    ui.add_space(40.0);
 
-                        if progress.fraction >= 0.0 {
-                            // Determinate progress bar
-                            let bar = egui::ProgressBar::new(progress.fraction)
-                                .show_percentage();
-                            ui.add_sized([300.0, 20.0], bar);
-                        } else {
-                            // Indeterminate spinner
-                            ui.add(egui::Spinner::new().size(40.0));
-                        }
+                    // Completed phases log
+                    let log_width = 600.0_f32.min(ui.available_width() - 40.0);
+                    let left_margin = (ui.available_width() - log_width) / 2.0;
+                    ui.add_space(left_margin.max(0.0) * 0.0); // vertical alignment handled by add_space above
 
-                        ui.add_space(16.0);
-                        ui.label(egui::RichText::new(&progress.phase).size(16.0));
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - log_width) / 2.0);
+                        ui.vertical(|ui| {
+                            ui.set_min_width(log_width);
+
+                            for entry in &progress.completed {
+                                let duration = format_duration(entry.duration);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("✓").color(Color32::from_rgb(80, 200, 80)));
+                                    ui.label(egui::RichText::new(&entry.label).monospace().size(13.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(duration).monospace().size(13.0).weak());
+                                    });
+                                });
+                            }
+
+                            // Current in-progress phase
+                            if !progress.phase.is_empty() && !progress.done {
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Spinner::new().size(14.0));
+                                    ui.label(egui::RichText::new(&progress.phase).monospace().size(13.0));
+                                });
+
+                                // Progress bar for determinate phases (e.g. file read)
+                                if progress.fraction >= 0.0 && progress.fraction < 1.0 {
+                                    ui.add_space(4.0);
+                                    let bar = egui::ProgressBar::new(progress.fraction)
+                                        .show_percentage();
+                                    ui.add_sized([log_width.min(400.0), 16.0], bar);
+                                }
+                            }
+
+                            if progress.done {
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("✓").color(Color32::from_rgb(80, 200, 80)).strong());
+                                    ui.label(egui::RichText::new("All done — rendering…").monospace().size(13.0).strong());
+                                });
+                            }
+                        });
                     });
                 });
+
                 // Keep repainting while loading so the progress updates
                 ctx.request_repaint();
                 return;
@@ -1116,6 +1297,18 @@ impl eframe::App for SvgViewerApp {
                     vertices_emitted: std::rc::Rc::new(std::cell::Cell::new(0)),
                 };
                 renderer::render(&render_ctx);
+
+                // Log first-render timing into the progress log
+                if let Some(t) = self.install_time.take() {
+                    let duration = t.elapsed();
+                    if let Ok(mut guard) = self.load_progress.lock() {
+                        guard.completed.push(PhaseEntry {
+                            label: "First render frame".to_string(),
+                            duration,
+                        });
+                    }
+                    log::info!("First render frame took {:.2}s", duration.as_secs_f64());
+                }
             }
 
             // Cursor hint
