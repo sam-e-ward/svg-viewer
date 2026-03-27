@@ -16,9 +16,11 @@ use egui::epaint::StrokeKind;
 
 use crate::clip_index::ClipIndex;
 use crate::elements_pane::ElementsPane;
+use crate::filter_pane;
 use crate::renderer::{GeometryCache, RenderContext, ViewTransform};
 use crate::spatial_index::SpatialIndex;
 use crate::svg_doc::{NodeId, SvgDocument, SvgNodeKind, SvgShape};
+use crate::visibility::VisibilityState;
 use crate::{filter, parser, renderer};
 
 /// A single completed phase in the loading log.
@@ -124,6 +126,13 @@ enum ActivePane {
     Elements,
 }
 
+/// Which tab is selected in the right side panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SideTab {
+    Elements,
+    Filter,
+}
+
 /// Minimum scale (zoom out limit)
 const MIN_SCALE: f32 = 0.01;
 /// Maximum scale (zoom in limit)
@@ -166,8 +175,12 @@ pub struct SvgViewerApp {
     panning: bool,
     last_drag_pos: Option<egui::Pos2>,
 
-    // --- Elements pane ---
+    // --- Side panel ---
+    /// Which tab is active in the right side panel
+    side_tab: SideTab,
     elements_pane: ElementsPane,
+    /// Visibility toggles for element types and path styles
+    visibility: Option<VisibilityState>,
     /// Viewport rect from the previous frame (for click-to-zoom from elements pane)
     last_viewport: Option<Rect>,
 
@@ -233,7 +246,9 @@ impl SvgViewerApp {
             tab_cursor_pos: None,
             panning: false,
             last_drag_pos: None,
+            side_tab: SideTab::Elements,
             elements_pane: ElementsPane::new(),
+            visibility: None,
             last_viewport: None,
             spatial_index: None,
             geometry_cache: GeometryCache::new(),
@@ -357,6 +372,8 @@ impl SvgViewerApp {
                 self.elements_pane.auto_collapse_large_groups(self.doc.as_ref().unwrap());
             }
         }
+        self.visibility = Some(VisibilityState::build(self.doc.as_ref().unwrap()));
+        self.side_tab = SideTab::Elements;
         self.file_path = Some(PathBuf::from(loaded.label.clone()));
         self.push_recent(loaded.label);
     }
@@ -905,7 +922,7 @@ impl eframe::App for SvgViewerApp {
             self.load_file(path, ctx.clone());
         }
 
-        // -- Right: elements pane --
+        // -- Right: side panel with Elements / Filter tabs --
         let elements_response = SidePanel::right("elements_panel")
             .resizable(true)
             .default_width(400.0)
@@ -913,82 +930,107 @@ impl eframe::App for SvgViewerApp {
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
                     ui.add_space(4.0);
-                    ui.heading("Elements");
+
+                    // Tab bar
+                    ui.horizontal(|ui| {
+                        let elements_selected = self.side_tab == SideTab::Elements;
+                        let filter_selected = self.side_tab == SideTab::Filter;
+
+                        if ui.selectable_label(elements_selected, egui::RichText::new("Elements").strong()).clicked() {
+                            self.side_tab = SideTab::Elements;
+                        }
+                        if ui.selectable_label(filter_selected, egui::RichText::new("Filter").strong()).clicked() {
+                            self.side_tab = SideTab::Filter;
+                        }
+                    });
                     ui.separator();
 
-                    if let Some(doc) = &self.doc {
-                        // We need a mutable borrow of elements_pane and immutable doc.
-                        // Temporarily take the doc out to satisfy borrow checker.
-                        let doc_ref = doc as *const SvgDocument;
-                        let doc_ref = unsafe { &*doc_ref };
+                    match self.side_tab {
+                        SideTab::Elements => {
+                            if let Some(doc) = &self.doc {
+                                let doc_ref = doc as *const SvgDocument;
+                                let doc_ref = unsafe { &*doc_ref };
 
-                        let (clicked, hovered) = self.elements_pane.show(ui, doc_ref);
+                                let (clicked, hovered) = self.elements_pane.show(ui, doc_ref);
 
-                        // Update group bbox highlight based on what's hovered (no spacebar needed)
-                        self.group_highlight_bbox = None;
-                        if let Some(h) = hovered {
-                            let is_group = matches!(
-                                doc_ref.get(h).kind,
-                                SvgNodeKind::Group | SvgNodeKind::Svg { .. }
-                                    | SvgNodeKind::Defs | SvgNodeKind::ClipPath { .. }
-                                    | SvgNodeKind::Mask { .. }
-                            );
-                            if is_group {
-                                self.group_highlight_bbox = self.spatial_index
-                                    .as_ref()
-                                    .and_then(|idx| idx.bbox_for_subtree(doc_ref, h));
-                            }
-                        }
-
-                        // Spacebar + hover → highlight leaf in viewer (only when Elements is active)
-                        if self.spacebar_held && self.active_pane == ActivePane::Elements {
-                            if let Some(h) = hovered {
-                                let is_leaf = matches!(doc_ref.get(h).kind, SvgNodeKind::Shape(_));
-                                if is_leaf {
-                                    self.highlighted = Some(h);
-                                    self.highlight_transient = true;
-                                }
-                            }
-                        }
-
-                        // Click → highlight + zoom (suppressed on activation frame)
-                        if !self.activation_consumed {
-                            if let Some(clicked_id) = clicked {
-                                let is_group = matches!(
-                                    doc_ref.get(clicked_id).kind,
-                                    SvgNodeKind::Group | SvgNodeKind::Svg { .. }
-                                        | SvgNodeKind::Defs | SvgNodeKind::ClipPath { .. }
-                                        | SvgNodeKind::Mask { .. }
-                                );
-                                if is_group {
-                                    if let Some(idx) = &self.spatial_index {
-                                        if let Some(bbox) = idx.bbox_for_subtree(doc_ref, clicked_id) {
-                                            self.group_highlight_bbox = Some(bbox);
-                                            self.zoom_to_bbox(bbox);
-                                        }
+                                // Update group bbox highlight based on what's hovered
+                                self.group_highlight_bbox = None;
+                                if let Some(h) = hovered {
+                                    let is_group = matches!(
+                                        doc_ref.get(h).kind,
+                                        SvgNodeKind::Group | SvgNodeKind::Svg { .. }
+                                            | SvgNodeKind::Defs | SvgNodeKind::ClipPath { .. }
+                                            | SvgNodeKind::Mask { .. }
+                                    );
+                                    if is_group {
+                                        self.group_highlight_bbox = self.spatial_index
+                                            .as_ref()
+                                            .and_then(|idx| idx.bbox_for_subtree(doc_ref, h));
                                     }
-                                } else {
-                                    self.highlighted = Some(clicked_id);
-                                    self.highlight_transient = false;
-                                    self.group_highlight_bbox = None;
-                                    if let Some(idx) = &self.spatial_index {
-                                        if let Some(bbox) = idx.bbox_for_node(clicked_id) {
-                                            self.zoom_to_bbox(bbox);
+                                }
+
+                                // Spacebar + hover → highlight leaf in viewer
+                                if self.spacebar_held && self.active_pane == ActivePane::Elements {
+                                    if let Some(h) = hovered {
+                                        let is_leaf = matches!(doc_ref.get(h).kind, SvgNodeKind::Shape(_));
+                                        if is_leaf {
+                                            self.highlighted = Some(h);
+                                            self.highlight_transient = true;
                                         }
                                     }
                                 }
+
+                                // Click → highlight + zoom
+                                if !self.activation_consumed {
+                                    if let Some(clicked_id) = clicked {
+                                        let is_group = matches!(
+                                            doc_ref.get(clicked_id).kind,
+                                            SvgNodeKind::Group | SvgNodeKind::Svg { .. }
+                                                | SvgNodeKind::Defs | SvgNodeKind::ClipPath { .. }
+                                                | SvgNodeKind::Mask { .. }
+                                        );
+                                        if is_group {
+                                            if let Some(idx) = &self.spatial_index {
+                                                if let Some(bbox) = idx.bbox_for_subtree(doc_ref, clicked_id) {
+                                                    self.group_highlight_bbox = Some(bbox);
+                                                    self.zoom_to_bbox(bbox);
+                                                }
+                                            }
+                                        } else {
+                                            self.highlighted = Some(clicked_id);
+                                            self.highlight_transient = false;
+                                            self.group_highlight_bbox = None;
+                                            if let Some(idx) = &self.spatial_index {
+                                                if let Some(bbox) = idx.bbox_for_node(clicked_id) {
+                                                    self.zoom_to_bbox(bbox);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if self.error.is_none() && self.load_error.is_none() {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Open an SVG file to begin")
+                                            .weak()
+                                            .italics(),
+                                    );
+                                });
                             }
                         }
-                    } else if self.error.is_some() {
-                        // Error shown in main panel
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(
-                                egui::RichText::new("Open an SVG file to begin")
-                                    .weak()
-                                    .italics(),
-                            );
-                        });
+                        SideTab::Filter => {
+                            if let Some(vis) = &mut self.visibility {
+                                filter_pane::show_filter_pane(ui, vis);
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Open an SVG file to begin")
+                                            .weak()
+                                            .italics(),
+                                    );
+                                });
+                            }
+                        }
                     }
                 });
             });
@@ -1255,6 +1297,7 @@ impl eframe::App for SvgViewerApp {
                             if self.highlighted != Some(hit) {
                                 self.highlighted = Some(hit);
                                 self.highlight_transient = true;
+                                self.side_tab = SideTab::Elements;
                                 let doc_ptr = doc as *const SvgDocument;
                                 let doc_ref = unsafe { &*doc_ptr };
                                 self.elements_pane.select_and_scroll(hit, doc_ref);
@@ -1294,6 +1337,7 @@ impl eframe::App for SvgViewerApp {
                     textures: &self.textures,
                     cache: &self.geometry_cache,
                     clips: &self.clip_index,
+                    visibility: self.visibility.as_ref(),
                     vertices_emitted: std::rc::Rc::new(std::cell::Cell::new(0)),
                 };
                 renderer::render(&render_ctx);

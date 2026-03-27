@@ -3,9 +3,11 @@ mod svg_doc;
 mod parser;
 mod renderer;
 mod elements_pane;
+mod filter_pane;
 mod spatial_index;
 mod clip_index;
 mod filter;
+mod visibility;
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();

@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use crate::clip_index::ClipIndex;
+use crate::visibility::VisibilityState;
 use lyon::geom::point;
 use lyon::math::Point;
 use lyon::path::Path as LyonPath;
@@ -244,6 +245,8 @@ pub struct RenderContext<'a> {
     pub textures: &'a HashMap<NodeId, TextureHandle>,
     pub cache: &'a GeometryCache,
     pub clips: &'a ClipIndex,
+    /// Visibility toggles for element types and path styles.
+    pub visibility: Option<&'a VisibilityState>,
     /// Running count of vertices emitted this frame (shared across clipped sub-contexts).
     pub vertices_emitted: Rc<Cell<usize>>,
 }
@@ -319,6 +322,7 @@ fn render_node(ctx: &RenderContext, node_id: NodeId, parent_tf: &Transform) {
                 textures: ctx.textures,
                 cache: ctx.cache,
                 clips: ctx.clips,
+                visibility: ctx.visibility,
                 vertices_emitted: ctx.vertices_emitted.clone(),
             };
             &clipped_ctx
@@ -341,6 +345,12 @@ fn render_node(ctx: &RenderContext, node_id: NodeId, parent_tf: &Transform) {
             }
         }
         SvgNodeKind::Shape(shape) => {
+            // Visibility toggle: skip shapes disabled in the Filter pane
+            if let Some(vis) = ctx.visibility {
+                if !vis.is_visible(node.id, shape) {
+                    return;
+                }
+            }
             // Viewport cull: skip shapes whose screen-space AABB doesn't
             // intersect the visible viewport. This is the critical optimisation
             // for high zoom levels where most elements are off-screen.
