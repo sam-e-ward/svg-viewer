@@ -44,7 +44,7 @@ ureq = { version = "2", features = ["tls"] }
 [package.metadata.bundle]
 name = "SVG Viewer"
 identifier = "com.samward.svg-viewer"
-copyright = "Copyright © 2025 Sam Ward"
+copyright = "Copyright © 2026 Sam Ward"
 category = "public.app-category.graphics-design"
 short_description = "A lightweight SVG viewer"
 icon = ["assets/icon.icns"]
